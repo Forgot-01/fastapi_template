@@ -13,7 +13,7 @@ from app.core.utils import fromtimestamp, now_utc
 
 
 @dataclass
-class RoleRepository(IRepository[Role, RoleFilter]):
+class RoleRepository(IRepository[Role]):
     async def get_with_permission_by_name(self, name: str) -> Role | None:
         query = select(Role).options(selectinload(Role.permissions)).where(Role.name == name)
         result = await self.session.execute(query)
@@ -32,9 +32,9 @@ class RoleRepository(IRepository[Role, RoleFilter]):
     async def create(self, role: Role) -> None:
         self.session.add(role)
 
-    def apply_relationship_filters(self, stmt: Select, filters: RoleFilter) -> Select:
-        if filters.permission_names:
-            stmt = stmt.where(Role.permissions.any(Permission.name.in_(filters.permission_names)))
+    def apply_relationship_filters(self, stmt: Select, _filters: RoleFilter) -> Select:
+        if _filters.permission_names:
+            stmt = stmt.where(Role.permissions.any(Permission.name.in_(_filters.permission_names)))
 
         return stmt
 
@@ -53,14 +53,17 @@ class RoleInvalidateRepository:
 
     async def get_role_invalidation_time(self, role_name: str) -> str | None:
         key = f"invalid_role:{role_name}"
-        return await self.client.get(key)
+        return await self.client.get(key) # pyright: ignore[reportReturnType]
 
     async def get_max_invalidation_time(self, role_names: list[str]) -> datetime:
         keys = [f"invalid_role:{permission_name}" for permission_name in role_names]
+        if not keys:
+            return fromtimestamp(0.0)
+
         values = await self.client.mget(*keys)
 
-        if len(values) == 0:
-            return fromtimestamp(0.00)
-
-        max_date = max(values, key=lambda x: fromtimestamp(float(x)))
-        return fromtimestamp(float(max_date))
+        max_date = max(
+            values,
+            key=lambda x: float(x) if x else 0.0
+        ) # pyright: ignore[reportArgumentType]
+        return fromtimestamp(float(max_date)) if max_date else fromtimestamp(0.0) # pyright: ignore[reportArgumentType]

@@ -6,6 +6,12 @@ from pydantic_core import MultiHostUrl
 from app.core.configs.base import BaseConfig
 
 
+def _with_scheme(value: str, *, secure: bool) -> str:
+    if value.startswith(("http://", "https://")):
+        return value.rstrip("/")
+    return f"{'https' if secure else 'http'}://{value.rstrip('/')}"
+
+
 class AppConfig(BaseConfig):
     _PRODUCTION_REQUIRED_FIELDS: ClassVar[tuple[str, ...]] = (
         "SECRET_KEY",
@@ -19,15 +25,17 @@ class AppConfig(BaseConfig):
     )
 
     ENVIRONMENT: Literal["local", "production", "testing"] = "local"
-    PROJECT_NAME: str = "FastAPI Template"
+    PROJECT_NAME: str = "Social"
 
     DOMAIN: str = "localhost"
     HOST: str = "127.0.0.1"
     PORT: int = 80
 
+    BOT_TOKEN: str = ""
+
     API_V1_STR: str = "/api/v1"
     SECRET_KEY: str = ""
-    BACKEND_CORS_ORIGINS: ClassVar[Annotated[list[str] | str, BeforeValidator(BaseConfig.parse_list)]] = []
+    BACKEND_CORS_ORIGINS: Annotated[list[str] | str, BeforeValidator(BaseConfig.parse_list)] = []
     RATE_LIMITER_ENABLED: bool = True
 
     POSTGRES_SERVER: str = ""
@@ -37,14 +45,14 @@ class AppConfig(BaseConfig):
     POSTGRES_DB: str = ""
     SQL_ECHO: bool = False
 
-    @computed_field
+    @computed_field # type: ignore[prop-decorator]
     @property
     def app_url(self) -> str:
         if self.ENVIRONMENT in ["local", "testing"]:
             return f"http://{self.DOMAIN}"
         return f"https://{self.DOMAIN}"
 
-    @computed_field
+    @computed_field # type: ignore[prop-decorator]
     @property
     def postgres_url(self) -> PostgresDsn:
         return MultiHostUrl.build(
@@ -59,21 +67,37 @@ class AppConfig(BaseConfig):
     REDIS_HOST: str = ""
     REDIS_PORT: int = 6379
 
-    @computed_field
+    @computed_field # type: ignore[prop-decorator]
     @property
     def redis_url(self) -> str:
         return f"redis://{self.REDIS_HOST}:{self.REDIS_PORT}"
 
     STORAGE_HOST: str = ""
-    STORAGE_PORT: int = 9000
+    STORAGE_PORT: int = 8333
     STORAGE_ACCESS_KEY: str = ""
     STORAGE_SECRET_KEY: str = ""
     STORAGE_PUBLIC_URL: str = ""
+    STORAGE_REGION: str = "us-east-1"
+    STORAGE_SECURE: bool = False
+    STORAGE_PUBLIC_SECURE: bool = True
+    STORAGE_SSE: bool = False
 
-    @computed_field
+    @computed_field # type: ignore[prop-decorator]
     @property
     def storage_url(self) -> str:
         return f"{self.STORAGE_HOST}:{self.STORAGE_PORT}"
+
+    @computed_field # type: ignore[prop-decorator]
+    @property
+    def storage_endpoint_url(self) -> str:
+        return _with_scheme(self.storage_url, secure=self.STORAGE_SECURE)
+
+    @computed_field # type: ignore[prop-decorator]
+    @property
+    def storage_public_endpoint_url(self) -> str:
+        if not self.STORAGE_PUBLIC_URL:
+            return self.storage_endpoint_url
+        return _with_scheme(self.STORAGE_PUBLIC_URL, secure=self.STORAGE_PUBLIC_SECURE)
 
     BROKER_URL: str = ""
     GROUP_ID: str = ""
@@ -94,13 +118,36 @@ class AppConfig(BaseConfig):
     LOG_LEVEL: str = "INFO"
     JSON_LOG: bool = True
     PATH_LOG: str | None = ".logs/logs.log"
-    LOG_HANDLERS: ClassVar[Annotated[list[
+    LOG_HANDLERS: Annotated[list[
         Literal["stream", "file"]] | str, BeforeValidator(BaseConfig.parse_list)
-    ]] = ["stream"]
+    ] = ["stream"]
 
     # Auth
     JWT_SECRET_KEY: str = ""
     JWT_ALGORITHM: str = "HS256"
+
+    OUTBOX_RETENTION_DAYS: int = 7
+    OUTBOX_CLEANUP_INTERVAL_SECONDS: int = 3_600
+    OUTBOX_CLEANUP_BATCH_SIZE: int = 5_000
+
+    WS_HEARTBEAT_INTERVAL: int = 30
+    WS_HEARTBEAT_TIMEOUT: int = 75
+    WS_SEND_QUEUE_SIZE: int = 256
+    WS_MAX_CONNECTIONS_PER_USER: int = 2
+    WS_REDIS_CONNECTION_TTL: int = 90
+    WS_ACTIVE_SUBSCRIPTION_TTL: int = 120
+
+    WS_PRESENCE_TTL: int = 90
+    WS_PRESENCE_CLEANUP_EVERY_TICKS: int = 10
+
+    WS_GATEWAY_STREAM_MAXLEN: int = 200_000
+    WS_GATEWAY_STREAM_READ_COUNT: int = 200
+    WS_GATEWAY_STREAM_BLOCK_MS: int = 5_000
+    WS_GATEWAY_STREAM_USERS_PER_ENTRY: int = 1_000
+    WS_GATEWAY_STREAM_CLAIM_MIN_IDLE_MS: int = 60_000
+    WS_GATEWAY_STREAM_CLAIM_COUNT: int = 100
+    WS_GATEWAY_STREAM_CLAIM_INTERVAL: int = 30
+    WS_GATEWAY_STREAM_METRICS_INTERVAL: int = 15
 
     @model_validator(mode="after")
     def validate_production_required_settings(self) -> AppConfig:
@@ -112,6 +159,7 @@ class AppConfig(BaseConfig):
             for field in self._PRODUCTION_REQUIRED_FIELDS
             if not str(getattr(self, field, "")).strip()
         ]
+
         if missing_fields:
             fields = ", ".join(missing_fields)
             raise ValueError(f"Missing required production settings: {fields}")

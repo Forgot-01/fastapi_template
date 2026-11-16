@@ -1,13 +1,16 @@
+from __future__ import annotations
+
 from typing import TYPE_CHECKING
 
 from sqlalchemy import ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from app.auth.models.user import User
 from app.core.db.base_model import BaseModel, DateMixin
 
 if TYPE_CHECKING:
     from app.auth.models.role import Role
-    from app.auth.models.user import User
+
 
 
 class RolePermissions(BaseModel):

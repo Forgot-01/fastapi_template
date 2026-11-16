@@ -1,15 +1,18 @@
+import asyncio
+import contextlib
 import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 import structlog
-from dishka.integrations.faststream import FastStreamProvider, setup_dishka
+from dishka_faststream import FastStreamProvider, setup_dishka
 from faststream import ContextRepo
 from faststream.asgi import AsgiFastStream
 from faststream.kafka import KafkaBroker
 from faststream.kafka.prometheus import KafkaPrometheusMiddleware
 from prometheus_client import CollectorRegistry, make_asgi_app
 
+from app.auth.consumers import user as auth_user
 from app.core.configs.app import app_config
 from app.core.di.container import create_container
 from app.core.log.init import configure_logging
@@ -22,7 +25,7 @@ logger = logging.getLogger(__name__)
 async def lifespan(context: ContextRepo) -> AsyncGenerator[None]:
     logger.info("Starting FastStream")
     container = context.get("container__")
-    message_broker = await container.get(BaseMessageBroker)
+    message_broker: BaseMessageBroker = await container.get(BaseMessageBroker)
     await message_broker.start()
 
     yield
@@ -31,7 +34,8 @@ async def lifespan(context: ContextRepo) -> AsyncGenerator[None]:
 
 
 def setup_router(broker: KafkaBroker) -> None:
-    ...
+    broker.include_router(auth_user.router)
+
 
 def init_app() -> AsgiFastStream:
     configure_logging()

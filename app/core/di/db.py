@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio.session import AsyncSession, async_sessionmaker
 
 from app.core.configs.app import app_config
 from app.core.db.session import create_async_maker, create_engine
+from app.core.outbox.repository import OutboxRepository
 
 
 class DBProvider(Provider):
@@ -19,16 +20,26 @@ class DBProvider(Provider):
         await engine.dispose(close=True)
 
     @provide(scope=Scope.APP)
-    async def get_marker(self, engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
+    async def get_maker(self, engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
         return create_async_maker(engine=engine)
 
     @provide(scope=Scope.REQUEST)
     async def get_session(
-        self, marker: async_sessionmaker[AsyncSession]
+        self, maker: async_sessionmaker[AsyncSession]
     ) -> AsyncIterable[AsyncSession]:
-        async with marker() as session:
+        async with maker() as session:
             yield session
+
+    @provide(scope=Scope.REQUEST)
+    def outbox_repository(self, session: AsyncSession) -> OutboxRepository:
+        return OutboxRepository(session=session)
 
     @provide(scope=Scope.APP)
     async def get_redis(self) -> Redis:
-        return Redis.from_url(app_config.redis_url, max_connections=50, decode_responses=True)
+        return Redis.from_url(
+            app_config.redis_url,
+            max_connections=200,
+            decode_responses=True,
+            socket_connect_timeout=5,
+            socket_timeout=10,
+        )

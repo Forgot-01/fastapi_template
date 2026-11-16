@@ -6,6 +6,7 @@ services:
       - "127.0.0.1:9090:9090"
     volumes:
       - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
       - prometheus.data:/prometheus:rw
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
@@ -31,7 +32,7 @@ services:
     image: grafana/grafana:12.3.7
     container_name: grafana
     ports:
-      - "127.0.0.1:3000:3000"
+      - "${GRAFANA_BIND_HOST:-127.0.0.1}:3000:3000"
     volumes:
       - grafana.data:/var/lib/grafana:rw
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
@@ -124,6 +125,9 @@ services:
       - "127.0.0.1:9187:9187"
     environment:
       - DATA_SOURCE_NAME=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}?sslmode=disable
+    command:
+      - '--collector.replication_slot'
+      - '--collector.wal'
     networks:
       - app-network
     restart: unless-stopped

@@ -1,10 +1,16 @@
 import logging
 from dataclasses import dataclass
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.dtos.user import UserDTO
-from app.auth.exceptions import DuplicateUserError, NotFoundRoleError, PasswordMismatchError
+from app.auth.exceptions import (
+    DuplicateUserError,
+    InvalidUsernameError,
+    NotFoundRoleError,
+    PasswordMismatchError,
+)
 from app.auth.models.role_permission import RolesEnum
 from app.auth.models.user import User
 from app.auth.repositories.role import RoleRepository
@@ -36,9 +42,10 @@ class RegisterCommandHandler(BaseCommandHandler[RegisterCommand, UserDTO]):
         if email_user is not None:
             raise DuplicateUserError(field="email", value=command.email)
 
-        username_user = await self.user_repository.get_by_username(command.username)
+        if User.is_reserved_username(command.username):
+            raise InvalidUsernameError(username=command.username, reason="reserved")
 
-        if username_user is not None:
+        if await self.user_repository.is_username_taken(command.username):
             raise DuplicateUserError(field="username", value=command.username)
 
         if command.password != command.password_repeat:
@@ -58,8 +65,17 @@ class RegisterCommandHandler(BaseCommandHandler[RegisterCommand, UserDTO]):
         )
         await self.user_repository.create(user)
 
-        await self.session.commit()
         await self.event_bus.publish(user.pull_events())
+        try:
+            await self.session.commit()
+        except IntegrityError as exc:
+            await self.session.rollback()
+            if "username" in str(exc.orig):
+                raise DuplicateUserError(field="username", value=command.username) from exc
+            if "email" in str(exc.orig):
+                raise DuplicateUserError(field="email", value=command.email) from exc
+            raise
+
         await self.user_repository.invalidate_cache()
 
         user_dto = UserDTO.model_validate(user)

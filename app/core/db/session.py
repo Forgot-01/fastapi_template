@@ -1,22 +1,24 @@
-from sqlalchemy import AsyncAdaptedQueuePool, NullPool
+from sqlalchemy import AsyncAdaptedQueuePool, NullPool, Pool
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.configs.app import app_config
 
 
 def create_engine() -> AsyncEngine:
+    pool_class: type[Pool]
+
     if app_config.ENVIRONMENT == "testing":
         pool_class = NullPool
         pool_size = 0
         max_overflow = 0
     else:
         pool_class = AsyncAdaptedQueuePool
-        pool_size = 10
-        max_overflow = 15
+        pool_size = 15
+        max_overflow = 0
 
     return create_async_engine(
         str(app_config.postgres_url),
-        pool_pre_ping=True,
+        pool_pre_ping=False,
         pool_size=pool_size,
         poolclass=pool_class,
         max_overflow=max_overflow,

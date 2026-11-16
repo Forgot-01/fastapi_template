@@ -6,7 +6,6 @@ from datetime import timedelta
 
 from app.auth.config import auth_config
 from app.auth.emails.templates import ResetTokenTemplate
-from app.auth.exceptions import NotFoundUserError
 from app.auth.repositories.session import TokenBlacklistRepository
 from app.auth.repositories.user import UserRepository
 from app.core.commands import BaseCommand, BaseCommandHandler
@@ -28,21 +27,22 @@ class SendResetPasswordCommandHandler(BaseCommandHandler[SendResetPasswordComman
     async def handle(self, command: SendResetPasswordCommand) -> None:
         user = await self.user_repository.get_by_email(email=command.email)
         if not user:
-            raise NotFoundUserError(user_by=command.email, user_field="email")
+            return
 
-        reset_token = secrets.token_urlsafe(32)
+        reset_token = secrets.token_urlsafe(4)
         hashed_token = hashlib.sha256(reset_token.encode()).hexdigest()
 
-        await self.token_repository.add_token(
+        await self.token_repository.add_code(
             hashed_token,
             user_id=user.id,
-            expiration=timedelta(minutes=auth_config.EMAIL_RESET_TOKEN_EXPIRE_MINUTES)
+            expiration=timedelta(minutes=auth_config.EMAIL_RESET_TOKEN_EXPIRE_MINUTES),
+            type_code="reset_password"
         )
 
         email_data = EmailData(subject="Password reset code", recipient=user.email)
         template = ResetTokenTemplate(
             username=user.username,
-            token=hashed_token,
+            token=reset_token,
             valid_minutes=auth_config.EMAIL_RESET_TOKEN_EXPIRE_MINUTES,
         )
         await self.mail_service.queue(template=template, email_data=email_data)

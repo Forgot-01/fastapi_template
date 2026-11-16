@@ -1,3 +1,4 @@
+import hashlib
 import logging
 from dataclasses import dataclass
 from datetime import timedelta
@@ -31,7 +32,10 @@ class ResetPasswordCommandHandler(BaseCommandHandler[ResetPasswordCommand, None]
     hash_service: HashService
 
     async def handle(self, command: ResetPasswordCommand) -> None:
-        user_id = await self.token_repository.is_valid_token(token=command.token)
+        hash_token = hashlib.sha256(command.token.encode()).hexdigest()
+        user_id = await self.token_repository.is_valid_code(
+            code=hash_token, type_code="reset_password"
+        )
 
         if user_id is None:
             raise InvalidTokenError(token=command.token)
@@ -45,10 +49,9 @@ class ResetPasswordCommandHandler(BaseCommandHandler[ResetPasswordCommand, None]
             raise PasswordMismatchError
 
         user.password_reset(self.hash_service.hash_password(command.password))
-        await self.token_repository.invalidate_token(token=command.token)
         await self.token_repository.add_user(user.id, expiration=timedelta(days=auth_config.REFRESH_TOKEN_EXPIRE_DAYS))
 
-
-        await self.session.commit()
         await self.event_bus.publish(user.pull_events())
+        await self.session.commit()
+
         logger.info("Password reset", extra={"user_id": user.id, "username": user.username})

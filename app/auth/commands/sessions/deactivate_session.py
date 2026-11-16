@@ -1,5 +1,6 @@
 import logging
 from dataclasses import dataclass
+from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -8,13 +9,14 @@ from app.auth.exceptions import NotFoundOrInactiveSessionError
 from app.auth.repositories.session import SessionRepository
 from app.auth.services.rbac import AuthRBACManager
 from app.core.commands import BaseCommand, BaseCommandHandler
+from app.core.events.service import BaseEventBus
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
 class UserDeactivateSessionCommand(BaseCommand):
-    session_id: int
+    session_id: UUID
     user_jwt_data: AuthUserJWTData
 
 
@@ -23,6 +25,7 @@ class UserDeactivateSessionCommandHandler(BaseCommandHandler[UserDeactivateSessi
     session: AsyncSession
     session_repository: SessionRepository
     rbac_manager: AuthRBACManager
+    event_bus: BaseEventBus
 
     async def handle(self, command: UserDeactivateSessionCommand) -> None:
         session = await self.session_repository.get_by_id(command.session_id)
@@ -36,6 +39,7 @@ class UserDeactivateSessionCommandHandler(BaseCommandHandler[UserDeactivateSessi
             raise NotFoundOrInactiveSessionError
 
         session.deactivate()
+        await self.event_bus.publish(session.pull_events())
         await self.session.commit()
         logger.info(
             "Deactivate session",

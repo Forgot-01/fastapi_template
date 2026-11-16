@@ -2,8 +2,6 @@ from app.core.configs.base import BaseConfig
 
 
 class AuthConfig(BaseConfig):
-    USER_REGISTRATION_ALLOWED: bool = False
-
     EMAIL_RESET_TOKEN_EXPIRE_MINUTES: int = 15
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 5
     REFRESH_TOKEN_EXPIRE_DAYS: int = 60
@@ -32,7 +30,22 @@ class AuthConfig(BaseConfig):
     OAUTH_GITHUB_TOKEN_URL: str = "https://github.com/login/oauth/access_token" # noqa: S105
     OAUTH_GITHUB_USERINFO_URL: str = "https://api.github.com/user"
 
-    USER_TOPIC: str = "users"
+    USER_TOPIC: str = "auth"
+    SEND_VERIFY_GROUP_ID: str = "send-verify-email"
+
+    USERNAME_MIN_LENGTH: int = 5
+    USERNAME_MAX_LENGTH: int = 32
+    USERNAME_RESERVED: frozenset[str] = frozenset({
+        "admin", "administrator", "moderator", "support", "help", "helpdesk",
+        "system", "official", "security", "abuse", "root", "superuser", "staff",
+        "service", "notifications", "bot", "username", "settings", "privacy",
+        "profile", "profiles", "contacts", "account", "chatix", "telegram",
+        "deleted", "anonymous", "null", "undefined",
+    })
+    USERNAME_CHANGE_RATE_TIMES: int = 5
+    USERNAME_CHANGE_RATE_SECONDS: int = 60 * 60
+    USERNAME_CHECK_RATE_TIMES: int = 30
+    USERNAME_CHECK_RATE_SECONDS: int = 60
 
 
 auth_config = AuthConfig()

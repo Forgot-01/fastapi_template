@@ -7,6 +7,7 @@ from urllib.parse import urlencode
 import httpx
 
 from app.auth.dtos.tokens import OAuthData, OAuthToken
+from app.auth.exceptions import NoEmailOAuthError, UnverifiedEmailOAuthError
 
 
 @dataclass
@@ -20,10 +21,13 @@ class OAuthProvider(ABC):
     userinfo_url: str
 
     @abstractmethod
-    def get_auth_url(self, state: str) -> str: ...
+    def get_auth_url(self, state: str, code_challenge: str) -> str: ...
 
     @abstractmethod
-    async def exchange_code_for_token(self, code: str) -> OAuthToken:
+    async def exchange_code_for_token(
+        self, code: str,
+        code_verifier: str,
+    ) -> OAuthToken:
         ...
 
     async def _exchange_code(self, data: dict[str, Any], headers: dict[str, Any]) -> OAuthToken:
@@ -47,6 +51,25 @@ class OAuthProvider(ABC):
     async def get_user_info(self, access_token: str) -> OAuthData:
         ...
 
+    def _require_verified_email(self, email: str | None, *, verified: bool) -> str:
+        if not email:
+            raise NoEmailOAuthError(provider=self.name)
+
+        if not verified:
+            raise UnverifiedEmailOAuthError(provider=self.name)
+
+        return email
+
+    @staticmethod
+    def _as_bool(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+
+        if isinstance(value, str):
+            return value.strip().lower() == "true"
+
+        return False
+
     async def _fetch_user_info(self, headers: dict[str, Any]) -> dict[str, Any]:
         async with httpx.AsyncClient() as client:
             response = await client.get(
@@ -59,7 +82,7 @@ class OAuthProvider(ABC):
 
 @dataclass
 class OAuthGoogle(OAuthProvider):
-    def get_auth_url(self, state: str) -> str:
+    def get_auth_url(self, state: str, code_challenge: str) -> str:
         params = {
             "client_id": self.client_id,
             "response_type": "code",
@@ -67,17 +90,23 @@ class OAuthGoogle(OAuthProvider):
             "redirect_uri": self.redirect_uri,
             "state": state,
             "access_type": "offline",
-            "prompt": "consent"
+            "prompt": "consent",
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
         }
         return f"{self.base_auth_url}?{urlencode(params)}"
 
-    async def exchange_code_for_token(self, code: str) -> OAuthToken:
+    async def exchange_code_for_token(
+        self, code: str,
+        code_verifier: str,
+    ) -> OAuthToken:
         data = {
             "client_id": self.client_id,
             "client_secret": self.client_secret,
             "code": code,
             "grant_type": "authorization_code",
-            "redirect_uri": self.redirect_uri
+            "redirect_uri": self.redirect_uri,
+            "code_verifier": code_verifier,
         }
         return await self._exchange_code(
             data=data,
@@ -90,30 +119,40 @@ class OAuthGoogle(OAuthProvider):
         )
         return OAuthData(
             provider_user_id=user_data["sub"],
-            email=user_data["email"],
+            email=self._require_verified_email(
+                user_data.get("email"),
+                verified=self._as_bool(user_data.get("email_verified")),
+            ),
             username=user_data.get("name"),
         )
 
 
 @dataclass
 class OAuthYandex(OAuthProvider):
-    def get_auth_url(self, state: str) -> str:
+    def get_auth_url(self, state: str, code_challenge: str) -> str:
         params = {
             "client_id": self.client_id,
             "response_type": "code",
             "redirect_uri": self.redirect_uri,
             "state": state,
-            "force_confirm": "yes"
+            "force_confirm": "yes",
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
         }
         return f"{self.base_auth_url}?{urlencode(params)}"
 
-    async def exchange_code_for_token(self, code: str) -> OAuthToken:
+    async def exchange_code_for_token(
+        self, code: str,
+        code_verifier: str,
+    ) -> OAuthToken:
         data = {
             "client_id": self.client_id,
             "client_secret": self.client_secret,
             "code": code,
             "grant_type": "authorization_code",
-            "redirect_uri": self.redirect_uri
+            "redirect_uri": self.redirect_uri,
+            "code_verifier": code_verifier,
+
         }
         return await self._exchange_code(
             data=data,
@@ -124,34 +163,39 @@ class OAuthYandex(OAuthProvider):
         user_data = await self._fetch_user_info(
             headers={"Authorization": f"OAuth {access_token}"}
         )
-        email = user_data.get("default_email")
-        if not email and user_data.get("emails"):
-            email = user_data["emails"][0]
+        emails = user_data.get("emails") or []
+        email = user_data.get("default_email") or (emails[0] if emails else None)
 
         return OAuthData(
             provider_user_id=user_data["id"],
-            email=email, # type: ignore
-            username=user_data.get("login"),
+            email=self._require_verified_email(email, verified=True),
+            username=user_data.get("login") or user_data.get("display_name"),
         )
 
-
+@dataclass
 class OAuthGithub(OAuthProvider):
-    def get_auth_url(self, state: str) -> str:
+    def get_auth_url(self, state: str, code_challenge: str) -> str:
         params = {
             "client_id": self.client_id,
             "redirect_uri": self.redirect_uri,
             "scope": "read:user,user:email",
             "state": state,
-            "allow_signup": "false"
+            "allow_signup": "false",
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
         }
         return f"{self.base_auth_url}?{urlencode(params)}"
 
-    async def exchange_code_for_token(self, code: str) -> OAuthToken:
+    async def exchange_code_for_token(
+        self, code: str,
+        code_verifier: str,
+    ) -> OAuthToken:
         data = {
             "client_id": self.client_id,
             "client_secret": self.client_secret,
             "code": code,
-            "redirect_uri": self.redirect_uri
+            "redirect_uri": self.redirect_uri,
+            "code_verifier": code_verifier,
         }
         return await self._exchange_code(
             data=data,
@@ -181,9 +225,19 @@ class OAuthGithub(OAuthProvider):
             response.raise_for_status()
             emails_data = response.json()
 
-            for email_data in emails_data:
-                if email_data.get("primary"):
-                    return email_data.get("email")
+        if not emails_data:
+            raise NoEmailOAuthError(provider=self.name)
 
-            return emails_data[0].get("email")
+        verified = [
+            email_data for email_data in emails_data
+            if email_data.get("email") and email_data.get("verified")
+        ]
+        if not verified:
+            raise UnverifiedEmailOAuthError(provider=self.name)
+
+        for email_data in verified:
+            if email_data.get("primary"):
+                return str(email_data["email"])
+
+        return str(verified[0]["email"])
 

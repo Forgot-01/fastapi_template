@@ -1,18 +1,21 @@
+x-app-base: &app-base
+  build:
+    context: .
+    target: production
+  tmpfs:
+    - /prometheus:uid=100,gid=101,mode=1777
+  env_file:
+    - .env
+  restart: unless-stopped
+  networks:
+    - app-network
+
 services:
   app:
-    profiles: ["api"]
-    build:
-      context: .
-      target: production
+    <<: *app-base
     container_name: app
     ports:
       - "8000:8000"
-    env_file:
-      - .env
-    environment:
-      PROMETHEUS_MULTIPROC_DIR: /prometheus
-    tmpfs:
-      - /prometheus
     command: >
       sh -c "
       rm -rf /prometheus/* &&
@@ -23,6 +26,7 @@ services:
       --bind 0.0.0.0:8000
       --timeout 120
       --graceful-timeout 30
+      --log-level warning
       "
     depends_on:
       db:
@@ -31,7 +35,7 @@ services:
         condition: service_healthy
       kafka:
         condition: service_healthy
-      minio:
+      seaweedfs:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://127.0.0.1:8000/health || exit 1"]
@@ -39,73 +43,93 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
-    restart: unless-stopped
-    networks:
-      - app-network
-    deploy:
-      resources:
-        limits:
-          cpus: "2"
-          memory: 1G
-        reservations:
-          memory: 256M
+
 
   consumers:
-    profiles: ["kafka"]
-    build:
-      context: .
-      target: production
+    <<: *app-base
     container_name: consumers
     hostname: consumers
-    env_file:
-      - .env
-    environment:
-      PROMETHEUS_MULTIPROC_DIR: /prometheus
-    tmpfs:
-      - /prometheus
     command: ["faststream", "run", "app.consumers:app", "--host", "0.0.0.0", "--port", "9002", "--workers", "2"]
     depends_on:
       kafka:
         condition: service_healthy
       db:
         condition: service_healthy
-    restart: unless-stopped
-    networks:
-      - app-network
     deploy:
       resources:
         limits:
           cpus: "1"
           memory: 512M
 
-  minio:
-    profiles: ["storage"]
-    image: minio/minio:RELEASE.2025-07-23T15-54-02Z
-    container_name: minio
-    command: server --console-address ":9001" /data
+  queue_worker:
+    <<: *app-base
+    container_name: queue_worker
+    command: ["taskiq", "worker", "app.tasks:broker", "--no-configure-logging"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1G
+
+  scheduler:
+    <<: *app-base
+    container_name: scheduler
+    command: ["taskiq", "scheduler", "app.tasks:scheduler", "--no-configure-logging"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  migrations:
+    <<: *app-base
+    container_name: migrations
+    command:
+    - sh
+    - -c
+    - |
+      alembic upgrade head
+      python -m app.init_data
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.46
+    container_name: seaweedfs
+    hostname: seaweedfs
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
     ports:
-      - "127.0.0.1:9000:9000"
-      - "127.0.0.1:9001:9001"
+      - "8333:8333"
+      - "127.0.0.1:9333:9333"
+      - "127.0.0.1:8888:8888"
     environment:
-      MINIO_ROOT_USER: ${STORAGE_ACCESS_KEY:?STORAGE_ACCESS_KEY is required}
-      MINIO_ROOT_PASSWORD: ${STORAGE_SECRET_KEY:?STORAGE_SECRET_KEY is required}
-      MINIO_API_CORS_ALLOW_ORIGIN: ${MINIO_CORS_ORIGIN:-*}
-      MINIO_BROWSER_REDIRECT_URL: ${MINIO_BROWSER_REDIRECT_URL:-http://localhost:9001}
-      MINIO_PROMETHEUS_AUTH_TYPE: "public"
-      MINIO_PROMETHEUS_JOB_ID: "minio"
-      MINIO_REGION: "us-east-1"
-      MINIO_BROWSER: "on"
-      MINIO_COMPRESSION: "gzip"
-      MINIO_COMPRESSION_EXTENSIONS: ".txt,.log,.json,.csv,.md"
-      MINIO_COMPRESSION_MIME_TYPES: "text/*,application/json,application/xml"
-      MINIO_MAX_CONNECTIONS: "1000"
+      STORAGE_ACCESS_KEY: ${STORAGE_ACCESS_KEY:?STORAGE_ACCESS_KEY is required}
+      STORAGE_SECRET_KEY: ${STORAGE_SECRET_KEY:?STORAGE_SECRET_KEY is required}
+      SEAWEEDFS_S3_PORT: "8333"
+      SEAWEEDFS_METRICS_PORT: "9324"
+      SEAWEEDFS_CORS_ORIGINS: ${SEAWEEDFS_CORS_ORIGINS:-*}
+      SEAWEEDFS_VOLUME_SIZE_LIMIT_MB: ${SEAWEEDFS_VOLUME_SIZE_LIMIT_MB:-1024}
     volumes:
-      - miniodata:/data
+      - seaweedfs_data:/data
+      - ./infra/seaweedfs/entrypoint.sh:/entrypoint.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://127.0.0.1:9000/minio/health/ready || exit 1"]
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:8333/healthz || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 5
+      start_period: 20s
     restart: unless-stopped
     networks:
       - app-network
@@ -115,8 +139,40 @@ services:
           cpus: "1"
           memory: 1G
 
+  seaweedfs_admin:
+    image: chrislusf/seaweedfs:4.46
+    container_name: seaweedfs_admin
+    command:
+      - admin
+      - -ip=0.0.0.0
+      - -port=23646
+      - -master=seaweedfs:9333
+      - -dataDir=/data
+      - -adminUser=${SEAWEEDFS_ADMIN_USER:-admin}
+      - -adminPassword=${SEAWEEDFS_ADMIN_PASSWORD:?SEAWEEDFS_ADMIN_PASSWORD is required}
+    ports:
+      - "127.0.0.1:23646:23646"
+    volumes:
+      - seaweedfs_admin_data:/data
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f -o /dev/null http://127.0.0.1:23646/login || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - app-network
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
   db:
-    profiles: ["api", "migrations"]
     image: postgres:18.3
     container_name: db
     ports:
@@ -145,7 +201,6 @@ services:
           memory: 2G
 
   redis:
-    profiles: ["api"]
     image: valkey/valkey:8.1-alpine
     container_name: "redis"
     ports:
@@ -153,9 +208,7 @@ services:
     command: >
       redis-server
       --maxmemory 2gb
-      --maxmemory-policy allkeys-lru
-      --save ""
-      --appendonly no
+      --maxmemory-policy noeviction
       --hz 20
       --tcp-backlog 511
       --timeout 0
@@ -176,54 +229,7 @@ services:
           cpus: "1"
           memory: 2200M
 
-  queue_worker:
-    profiles: ["taskiq"]
-    build:
-      context: .
-      target: production
-    container_name: queue_worker
-    env_file:
-      - .env
-    command: ["taskiq", "worker", "app.tasks:broker", "--no-configure-logging"]
-    depends_on:
-      redis:
-        condition: service_healthy
-      db:
-        condition: service_healthy
-    restart: unless-stopped
-    networks:
-      - app-network
-    deploy:
-      resources:
-        limits:
-          cpus: "1"
-          memory: 512M
-
-  scheduler:
-    profiles: ["taskiq"]
-    build:
-      context: .
-      target: production
-    container_name: scheduler
-    env_file:
-      - .env
-    command: ["taskiq", "scheduler", "app.tasks:scheduler", "--no-configure-logging"]
-    depends_on:
-      redis:
-        condition: service_healthy
-      db:
-        condition: service_healthy
-    restart: unless-stopped
-    networks:
-      - app-network
-    deploy:
-      resources:
-        limits:
-          cpus: "0.5"
-          memory: 256M
-
   kafka:
-    profiles: ["kafka"]
     image: confluentinc/cp-kafka:8.2.0
     container_name: kafka
     environment:
@@ -248,7 +254,7 @@ services:
       - kafka_data:/var/lib/kafka/data
       - kafka_secrets:/etc/kafka/secrets
     healthcheck:
-      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "kafka:9092", "--list"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -261,18 +267,83 @@ services:
     networks:
       - app-network
 
-  migrations:
-    profiles: ["migrations"]
-    build:
-      context: .
-      target: production
-    container_name: migrations
+  debezium:
+    image: debezium/connect:2.7.3.Final
+    container_name: debezium
     env_file:
       - .env
-    command: ["sh", "-c", "alembic upgrade head"]
+    ports:
+      - "8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: 1
+      CONFIG_STORAGE_TOPIC: connect-configs
+      OFFSET_STORAGE_TOPIC: connect-offsets
+      STATUS_STORAGE_TOPIC: connect-status
+
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+
+      KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+
+      CONNECT_PRODUCER_RETRIES: 10
+      CONNECT_PLUGIN_PATH: /kafka/connect
+
+      CONNECT_REST_ADVERTISED_HOST_NAME: debezium
+      CONNECT_LOG4J_ROOT_LOGLEVEL: INFO
+
+      CONNECT_CONFIG_PROVIDERS: env
+      CONNECT_CONFIG_PROVIDERS_ENV_CLASS: org.apache.kafka.common.config.provider.EnvVarConfigProvider
+
     depends_on:
+      kafka:
+        condition: service_healthy
       db:
         condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - app-network
+
+  debezium_connector:
+    image: curlimages/curl:latest
+    container_name: debezium_connector
+    depends_on:
+      - debezium
+    entrypoint: ["/bin/sh", "-c"]
+    env_file:
+      - .env
+    command:
+      - |
+        set -e
+
+        echo "Waiting for Debezium..."
+
+        until curl -sf http://debezium:8083/connectors >/dev/null; do
+          sleep 2
+        done
+
+        echo "Debezium is ready"
+
+        if ! curl -sf http://debezium:8083/connectors/outbox-connector >/dev/null; then
+          echo "Creating outbox connector..."
+
+          curl -sf \
+            -X POST \
+            -H 'Content-Type: application/json' \
+            --data @/config/outbox-connector.json \
+            http://debezium:8083/connectors
+
+          echo "Connector created"
+        else
+          echo "Connector already exists"
+        fi
+    volumes:
+      - ./infra/debezium/outbox-connector.json:/config/outbox-connector.json
     restart: "no"
     networks:
       - app-network
@@ -282,7 +353,9 @@ volumes:
   redis-data:
   kafka_data:
   kafka_secrets:
-  miniodata:
+  seaweedfs_data:
+  seaweedfs_admin_data:
+
 
 networks:
   app-network:

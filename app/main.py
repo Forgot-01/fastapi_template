@@ -4,14 +4,14 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import redis.asyncio as redis
-from dishka.integrations.fastapi import FastapiProvider, setup_dishka
+from aiojobs import Scheduler
+from dishka.integrations.fastapi import setup_dishka
 from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.utils import get_openapi
 from fastapi_limiter import FastAPILimiter
 from prometheus_fastapi_instrumentator.instrumentation import PrometheusFastApiInstrumentator
-from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 
@@ -27,8 +27,7 @@ from app.core.middlewares.context import ContextMiddleware
 from app.core.middlewares.log import LoggingMiddleware
 from app.core.routers import router as core_router
 from app.core.utils import now_utc
-from app.init_data import init_data
-from app.pre_start import pre_start
+from app.core.websocket.manager import ConnectionManager
 
 logger = logging.getLogger(__name__)
 
@@ -36,17 +35,20 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     logger.info("Starting FastAPI")
-    async with app.state.dishka_container() as request_container:
-        session = await request_container.get(AsyncSession)
-        await pre_start(session)
-        await init_data(session)
 
     redis_client = await app.state.dishka_container.get(redis.Redis)
     await FastAPILimiter.init(redis_client)
+
     message_broker: BaseMessageBroker = await app.state.dishka_container.get(BaseMessageBroker)
     await message_broker.start()
 
+    connection_manager = await app.state.dishka_container.get(ConnectionManager)
+
+    scheduler = Scheduler()
+    await scheduler.spawn(connection_manager.startup())
+
     yield
+    await scheduler.close()
     await redis_client.aclose()
     await message_broker.close()
     await app.state.dishka_container.close()
@@ -121,13 +123,14 @@ def handle_validation_exception(request: Request, exc: RequestValidationError) -
     )
 
 def handle_unknown_exception(request: Request, exc: Exception) -> ORJSONResponse:
-    logger.exception(
+    logger.error(
         "Unknown exception",
+        exc_info=exc,
         extra={
             "status": 500,
             "title": "Unknown exception",
+            "detail": str(exc),
             "code": "UNKNOWN_EXCEPTION",
-            "request_id": request.state.request_id
         }
     )
     return ORJSONResponse(
@@ -202,11 +205,11 @@ def custom_openapi(app: FastAPI) -> dict[str, Any]:
 def init_app() -> FastAPI:
 
     app = FastAPI(
-        openapi_url=(
-            f"{app_config.API_V1_STR}/openapi.json"
-            if app_config.ENVIRONMENT in ["local", "testing"]
-            else None
-        ),
+        # openapi_url=(
+        #     f"{app_config.API_V1_STR}/openapi.json"
+        #     if app_config.ENVIRONMENT in ["local", "testing"]
+        #     else None
+        # ),
         lifespan=lifespan,
         redirect_slashes=False
     )
@@ -219,7 +222,7 @@ def init_app() -> FastAPI:
     ).expose(app, should_gzip=True, tags=["core"])
 
     configure_logging()
-    container = create_container(FastapiProvider())
+    container = create_container()
     setup_dishka(container=container, app=app)
 
     setup_middleware(app)
@@ -228,6 +231,5 @@ def init_app() -> FastAPI:
     app.add_exception_handler(Exception, handle_unknown_exception)
     app.add_exception_handler(ApplicationError, handle_application_exception) # type: ignore
     app.add_exception_handler(RequestValidationError, handle_validation_exception) # type: ignore
-    app.openapi = lambda: custom_openapi(app) # type: ignore[method-assign]
+    app.openapi = lambda: custom_openapi(app)
     return app
-

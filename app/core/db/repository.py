@@ -1,5 +1,5 @@
 import hashlib
-from abc import ABC, abstractmethod
+from abc import ABC
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, ParamSpec, TypeVar
@@ -37,24 +37,13 @@ class PageResult[T]:
     def has_previous(self) -> bool:
         return self.page > 1
 
-    @property
-    def next_page(self) -> int | None:
-        return self.page + 1 if self.has_next else None
-
-    @property
-    def previous_page(self) -> int | None:
-        return self.page - 1 if self.has_previous else None
-
 
 @dataclass
-class IRepository[T, F: BaseFilter](ABC):
+class IRepository[T](ABC):
     session: AsyncSession
 
-    async def find_by_filter(self, model: type[T], filters: F) -> PageResult[T]:
-        if issubclass(model, SoftDeleteMixin):
-            stmt = model.select_not_deleted()
-        else:
-            stmt = select(model)
+    async def find_by_filter(self, model: type[T], filters: BaseFilter) -> PageResult[T]:
+        stmt = model.select_not_deleted() if issubclass(model, SoftDeleteMixin) else select(model)
 
         loading_options = SQLAlchemyFilterConverter.build_loading_options(model, filters.loading_config)
 
@@ -87,24 +76,12 @@ class IRepository[T, F: BaseFilter](ABC):
             page_size=filters.pagination.page_size
         )
 
-    async def count_by_filter(self, model: type[T], filters: F) -> int:
-        if issubclass(model, SoftDeleteMixin):
-            stmt = select(func.count()).select_from(model.select_not_deleted().subquery())
-        else:
-            stmt = select(func.count()).select_from(model)
-
-        conditions = SQLAlchemyFilterConverter.filter_to_sqlalchemy_conditions(model, filters)
-        stmt = self.apply_relationship_filters(stmt, filters)
-
-        if conditions:
-            stmt = stmt.where(and_(*conditions))
-
-        result = await self.session.execute(stmt)
-        return result.scalar_one()
-
-    @abstractmethod
-    def apply_relationship_filters(self, stmt: Select, filters: F) -> Select:
-        ...
+    def apply_relationship_filters(
+        self,
+        stmt: Select,
+        _filters: BaseFilter,
+    ) -> Select:
+        return stmt
 
 B = TypeVar("B", bound=BaseModel)
 
@@ -148,10 +125,11 @@ class CacheRepository:
         data = await self.redis.get(key)
 
         if data is None:
-            data = await func(*args, **kwargs)
-            cached_data = data.model_dump_json()
-            await self.redis.setex(key, time=ttl, value=cached_data)
-            return data
+            data_dto = await func(*args, **kwargs)
+            cached_data = data_dto.model_dump_json()
+            await self.redis.set(key, cached_data, ex=ttl)
+            return data_dto
+
         return type_model.model_validate_json(data)
 
     async def cache(
@@ -177,16 +155,17 @@ class CacheRepository:
         **kwargs: P.kwargs,
     ) -> PageResult[B]:
         data = await self.redis.get(key)
+
         if data is None:
-            data = await func(*args, **kwargs)
+            data_dto = await func(*args, **kwargs)
             payload = {
-                "items": [item.model_dump_json() for item in data.items],
-                "total": data.total,
-                "page": data.page,
-                "page_size": data.page_size
+                "items": [item.model_dump_json() for item in data_dto.items],
+                "total": data_dto.total,
+                "page": data_dto.page,
+                "page_size": data_dto.page_size
             }
-            await self.redis.setex(key, time=ttl, value=orjson.dumps(payload))
-            return data
+            await self.redis.set(key, value=orjson.dumps(payload), ex=ttl)
+            return data_dto
 
         data = orjson.loads(data)
         return PageResult(

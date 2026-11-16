@@ -1,7 +1,14 @@
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from sqlalchemy import BigInteger, Boolean, Enum as SQLEnum, ForeignKey, String
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    Enum as SQLEnum,
+    ForeignKey,
+    Index,
+    String,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.db.base_model import BaseModel, DateMixin
@@ -27,6 +34,14 @@ class OAuthAccount(BaseModel, DateMixin):
 
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
-    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="cascade", onupdate="cascade"))
+    user_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="cascade", onupdate="cascade"),
+        index=True
+    )
     user: Mapped[User] = relationship("User", back_populates="oauth_accounts")
 
+    __table_args__ = (
+        Index("uq_oauth_accounts_provider_user", "provider", "provider_user_id", unique=True),
+        Index("uq_oauth_accounts_user_provider", "user_id", "provider", unique=True),
+    )

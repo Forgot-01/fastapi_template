@@ -54,6 +54,42 @@ class OAuthStateNotFoundError(ApplicationError):
 
 
 @dataclass(kw_only=True)
+class OAuthProviderUnavailableError(ApplicationError):
+    provider: str
+
+    code: str = "OAUTH_PROVIDER_UNAVAILABLE"
+    status: int = 502
+
+    @property
+    def message(self) -> str:
+        return "OAuth is unavailable for this provider."
+
+    @property
+    def detail(self) -> dict[str, Any]:
+        return {"provider": self.provider}
+
+
+@dataclass(kw_only=True)
+class InvalidOAuthProviderError(ApplicationError):
+    code: str = "INVALID_OAUTH_PROVIDER"
+    status: int = 400
+
+    @property
+    def message(self) -> str:
+        return "Provider"
+
+
+@dataclass(kw_only=True)
+class OAuthInactiveError(ApplicationError):
+    code: str = "OAUTH_INACTIVE"
+    status: int = 502
+
+    @property
+    def message(self) -> str:
+        return "OAuth inactive."
+
+
+@dataclass(kw_only=True)
 class LinkedAnotherUserOAuthError(ApplicationError):
     provider: str
 
@@ -165,6 +201,39 @@ class DuplicateUserError(ApplicationError):
 
 
 @dataclass(kw_only=True)
+class InvalidUsernameError(ApplicationError):
+    username: str
+    reason: str
+
+    code: str = "INVALID_USERNAME"
+    status: int = 400
+
+    @property
+    def message(self) -> str:
+        return "Username is invalid"
+
+    @property
+    def detail(self) -> dict[str, Any]:
+        return {"username": self.username, "reason": self.reason}
+
+
+@dataclass(kw_only=True)
+class UsernameTakenError(ApplicationError):
+    username: str
+
+    code: str = "USERNAME_TAKEN"
+    status: int = 409
+
+    @property
+    def message(self) -> str:
+        return "Username is already taken"
+
+    @property
+    def detail(self) -> dict[str, Any]:
+        return {"username": self.username}
+
+
+@dataclass(kw_only=True)
 class DuplicateRoleError(ApplicationError):
     name: str
 
@@ -249,3 +318,35 @@ class TokenInBlacklistError(ApplicationError):
     @property
     def message(self) -> str:
         return ""
+
+
+@dataclass(kw_only=True)
+class UnverifiedEmailOAuthError(ApplicationError):
+    provider: str
+
+    code: str = "OAUTH_EMAIL_NOT_VERIFIED"
+    status: int = 403
+
+    @property
+    def message(self) -> str:
+        return "Provider did not confirm that the email belongs to this account"
+
+    @property
+    def detail(self) -> dict[str, Any]:
+        return {"provider": self.provider}
+
+
+@dataclass(kw_only=True)
+class NoEmailOAuthError(ApplicationError):
+    provider: str
+
+    code: str = "OAUTH_EMAIL_NOT_PROVIDED"
+    status: int = 400
+
+    @property
+    def message(self) -> str:
+        return "Provider returned no email for this account"
+
+    @property
+    def detail(self) -> dict[str, Any]:
+        return {"provider": self.provider}

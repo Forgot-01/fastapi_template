@@ -8,21 +8,33 @@ from app.auth.commands.permissions.add_permission_user import AddPermissionToUse
 from app.auth.commands.permissions.remove_permission_user import DeletePermissionToUserCommand
 from app.auth.commands.roles.assign_role_to_user import AssignRoleCommand
 from app.auth.commands.roles.remove_role_user import RemoveRoleCommand
+from app.auth.commands.users.change_username import ChangeUsernameCommand
+from app.auth.commands.users.delete import DeleteUserCommand
 from app.auth.commands.users.register import RegisterCommand
+from app.auth.config import auth_config
 from app.auth.deps import ActiveUserModel, AuthCurrentUserJWTData
 from app.auth.dtos.sessions import SessionDTO
-from app.auth.dtos.user import UserDTO
+from app.auth.dtos.user import UserDTO, UsernameAvailabilityDTO, UserShortDTO
 from app.auth.exceptions import (
     DuplicateUserError,
+    InvalidUsernameError,
     NotFoundPermissionsError,
     NotFoundRoleError,
     NotFoundUserError,
     PasswordMismatchError,
+    UsernameTakenError,
 )
 from app.auth.queries.sessions.get_list_by_user import GetListSessionsUserQuery
+from app.auth.queries.users.check_username import CheckUsernameQuery
 from app.auth.queries.users.get_list import GetListUserQuery
 from app.auth.schemas.roles.requests import RoleAssignRequest
-from app.auth.schemas.users.requests import GetUsersRequest, UserCreateRequest, UserPermissionRequest
+from app.auth.schemas.users.requests import (
+    ChangeUsernameRequest,
+    CheckUsernameRequest,
+    GetUsersRequest,
+    UserCreateRequest,
+    UserPermissionRequest,
+)
 from app.auth.schemas.users.responses import UserResponse
 from app.core.api.builder import create_response
 from app.core.api.rate_limiter import ConfigurableRateLimiter
@@ -34,15 +46,16 @@ router = APIRouter(route_class=DishkaRoute)
 
 
 @router.post(
-    "/register",
+    "/register/",
     summary="",
     description="",
     status_code=status.HTTP_201_CREATED,
     responses={
-        400: create_response(PasswordMismatchError()),
+        400: create_response(
+            [PasswordMismatchError(), InvalidUsernameError(username="admin", reason="reserved")]
+        ),
         409: create_response(DuplicateUserError(field="string", value="string"))
-    },
-    dependencies=[Depends(ConfigurableRateLimiter(times=4, seconds=5*60))]
+    }
 )
 async def register_user(
     mediator: FromDishka[BaseMediator],
@@ -63,7 +76,82 @@ async def register_user(
     )
 
 @router.get(
-    "/me",
+    "/username/check/",
+    summary="Check whether a username can be taken",
+    description="Applies the same rules as the username change, without changing anything.",
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(
+            ConfigurableRateLimiter(
+                times=auth_config.USERNAME_CHECK_RATE_TIMES,
+                seconds=auth_config.USERNAME_CHECK_RATE_SECONDS,
+            )
+        )
+    ],
+)
+async def check_username(
+    mediator: FromDishka[BaseMediator],
+    user_jwt_data: AuthCurrentUserJWTData,
+    params: Annotated[CheckUsernameRequest, Query()],
+) -> UsernameAvailabilityDTO:
+    return await mediator.handle_query(
+        CheckUsernameQuery(username=params.username, user_jwt_data=user_jwt_data)
+    )
+
+@router.put(
+    "/me/username/",
+    summary="Change own username",
+    description="5–32 characters: latin letters, digits and `_`, starts with a letter, "
+    "does not end with `_`. Uniqueness ignores case.",
+    status_code=status.HTTP_200_OK,
+    responses={
+        400: create_response(InvalidUsernameError(username="string", reason="format")),
+        404: create_response(NotFoundUserError(user_by=1, user_field="id")),
+        409: create_response(UsernameTakenError(username="string")),
+    },
+    dependencies=[
+        Depends(
+            ConfigurableRateLimiter(
+                times=auth_config.USERNAME_CHANGE_RATE_TIMES,
+                seconds=auth_config.USERNAME_CHANGE_RATE_SECONDS,
+            )
+        )
+    ],
+)
+async def change_username(
+    payload: ChangeUsernameRequest,
+    mediator: FromDishka[BaseMediator],
+    user_jwt_data: AuthCurrentUserJWTData,
+) -> UserResponse:
+    user: UserShortDTO = await mediator.handle_command(
+        ChangeUsernameCommand(username=payload.username, user_jwt_data=user_jwt_data)
+    )
+    return UserResponse(id=user.id, username=user.username, email=user.email)
+
+@router.delete(
+    "/{user_id}/",
+    summary="Delete user",
+    description="Delete user",
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses={
+        403: create_response(AccessDeniedError(need_permissions={"user:delete", "user:owner"})),
+        404: create_response(NotFoundUserError(user_by=1, user_field="id"))
+    }
+)
+async def delete_user(
+    user_id: int,
+    mediator: FromDishka[BaseMediator],
+    user_jwt_data: AuthCurrentUserJWTData,
+) -> None:
+    await mediator.handle_command(
+        DeleteUserCommand(
+            user_id=user_id,
+            user_jwt_data=user_jwt_data
+        )
+    )
+
+@router.get(
+    "/me/",
     summary="",
     description="",
     status_code=status.HTTP_200_OK,
@@ -81,7 +169,7 @@ async def me(user: ActiveUserModel) -> UserResponse:
     )
 
 @router.post(
-    "/{user_id}/roles",
+    "/{user_id}/roles/",
     summary="Adding a role to a user",
     description="Adding a role to a user",
     status_code=status.HTTP_200_OK,
@@ -89,7 +177,7 @@ async def me(user: ActiveUserModel) -> UserResponse:
         400: create_response(InvalidTokenError()),
         403: create_response(AccessDeniedError(need_permissions={"string" })),
         404: create_response(
-            [NotFoundRoleError(name="admin"), NotFoundUserError(user_by=1, user_field="id")]
+            [NotFoundRoleError(name="strig"), NotFoundUserError(user_by=1, user_field="id")]
         )
     }
 )
@@ -108,7 +196,7 @@ async def assign_role(
     )
 
 @router.delete(
-    "/{user_id}/roles/{role_name}",
+    "/{user_id}/roles/{role_name}/",
     summary="Removing a role from a user",
     description="Removing a role from a user",
     status_code=status.HTTP_204_NO_CONTENT,
@@ -116,7 +204,7 @@ async def assign_role(
         400: create_response(InvalidTokenError()),
         403: create_response(AccessDeniedError(need_permissions={"string" })),
         404: create_response(
-            [NotFoundRoleError(name="admin"), NotFoundUserError(user_by=1, user_field="id")]
+            [NotFoundRoleError(name="strig"), NotFoundUserError(user_by=1, user_field="id")]
         )
     }
 )
@@ -135,7 +223,7 @@ async def remove_role(
     )
 
 @router.post(
-    "/{user_id}/permissions",
+    "/{user_id}/permissions/",
     summary="Adding permissions to a user",
     description="Adding permissions to a user",
     status_code=status.HTTP_200_OK,
@@ -165,7 +253,7 @@ async def add_permissions_to_user(
     )
 
 @router.delete(
-    "/{user_id}/permissions",
+    "/{user_id}/permissions/",
     summary="Removing user permissions",
     description="Removing user permissions",
     status_code=status.HTTP_204_NO_CONTENT,
@@ -220,7 +308,7 @@ async def get_list_user(
 
 
 @router.get(
-    "/sessions",
+    "/sessions/",
     summary="Get active user sessions",
     description="Get active user sessions",
     status_code=status.HTTP_200_OK,
@@ -232,10 +320,9 @@ async def get_list_user_session(
     user_jwt_data: AuthCurrentUserJWTData,
     mediator: FromDishka[BaseMediator],
 ) -> list[SessionDTO]:
-    sessions: list[SessionDTO] = await mediator.handle_query(
+    return await mediator.handle_query(
         GetListSessionsUserQuery(
             user_jwt_data=user_jwt_data
         )
     )
-    return sessions
 

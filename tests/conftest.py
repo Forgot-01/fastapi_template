@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 from collections.abc import AsyncGenerator, Callable, Generator
 from datetime import timedelta
@@ -8,9 +9,11 @@ from uuid import uuid4
 import pytest
 from dishka import AsyncContainer, Provider, Scope, provide
 from dishka.integrations.fastapi import setup_dishka
+from dishka_faststream import setup_dishka as setup_faststream_dishka
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi_limiter import FastAPILimiter
+from faststream.kafka import KafkaBroker, TestKafkaBroker
 from httpx import ASGITransport, AsyncClient
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import (
@@ -21,9 +24,13 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from sqlalchemy.pool import NullPool
-from testcontainers.postgres import PostgresContainer
-from testcontainers.redis import AsyncRedisContainer
+from testcontainers.community.postgres import PostgresContainer
+from testcontainers.community.redis import AsyncRedisContainer
+from testcontainers.core.container import DockerContainer
+from testcontainers.core.wait_strategies import LogMessageWaitStrategy
 
+from app.auth.services.oauth_manager import OAuthProviderFactory
+from app.consumers import setup_router as setup_consumer_router
 from app.core.configs.app import app_config
 from app.core.db.base_model import BaseModel
 from app.core.di.container import create_container
@@ -31,14 +38,19 @@ from app.core.events.event import EventRegistry
 from app.core.events.service import BaseEventBus
 from app.core.exceptions import ApplicationError
 from app.core.log.init import configure_logging
+from app.core.message_brokers.base import BaseMessageBroker
+from app.core.outbox.repository import OutboxRepository
 from app.core.services.auth.dto import JwtTokenType, UserJWTData
 from app.core.services.auth.jwt_manager import JWTManager
 from app.core.services.auth.rbac import RBACManagerInterface
 from app.core.services.mail.service import BaseMailService
 from app.core.services.queues.service import QueueService
+from app.core.services.storage.aioboto.client import S3Client, s3_client
+from app.core.services.storage.aioboto.service import AioBotoStorageService
+from app.core.services.storage.policy import Policy
 from app.core.services.storage.service import StorageService
 from app.core.utils import now_utc
-from app.init_data import init_data
+from app.init_data import create_first_data
 from app.main import (
     custom_openapi,
     handle_application_exception,
@@ -47,7 +59,13 @@ from app.main import (
     setup_middleware,
     setup_router,
 )
-from tests.mocks import FakeQueueService, FakeStorageService, MockEventBus, MockMailService
+from tests.mocks import (
+    FakeMessageBroker,
+    FakeOAuthProvider,
+    FakeQueueService,
+    MockMailService,
+    RecordingEventBus,
+)
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
@@ -79,6 +97,99 @@ def redis_container() -> Generator[AsyncRedisContainer]:
         yield redis
 
 
+SEAWEEDFS_IMAGE = "chrislusf/seaweedfs:4.46"
+SEAWEEDFS_S3_PORT = 8333
+STORAGE_ACCESS_KEY = "test"
+STORAGE_SECRET_KEY = "test123"  # noqa: S105
+
+
+@pytest.fixture(scope="session")
+def storage_container() -> Generator[DockerContainer]:
+    identities = json.dumps(
+        {
+            "identities": [
+                {
+                    "name": "test",
+                    "credentials": [
+                        {"accessKey": STORAGE_ACCESS_KEY, "secretKey": STORAGE_SECRET_KEY}
+                    ],
+                    "actions": ["Admin", "Read", "Write", "List", "Tagging"],
+                }
+            ]
+        }
+    )
+    script = (
+        f"printf '%s' '{identities}' > /tmp/s3.json && "
+        f"exec weed server -dir=/data -ip.bind=0.0.0.0 -filer -s3 "
+        f"-s3.port={SEAWEEDFS_S3_PORT} -s3.config=/tmp/s3.json "
+        f"-master.volumeSizeLimitMB=64 -volume.max=0"
+    )
+
+    container = (
+        DockerContainer(SEAWEEDFS_IMAGE)
+        .with_exposed_ports(SEAWEEDFS_S3_PORT)
+        .with_command(["sh", "-c", script])
+        .with_kwargs(entrypoint="")
+        .waiting_for(LogMessageWaitStrategy("Start Seaweed S3 API Server"))
+    )
+
+    with container:
+        yield container
+
+
+@pytest.fixture(scope="session")
+def storage_endpoint(storage_container: DockerContainer) -> str:
+    host = storage_container.get_container_host_ip()
+    port = storage_container.get_exposed_port(SEAWEEDFS_S3_PORT)
+    return f"http://{host}:{port}"
+
+
+TEST_BUCKETS: dict[str, Policy] = {
+    "base": Policy.NONE,
+    "public": Policy.GET
+}
+
+
+def _build_storage_service(client: S3Client, endpoint: str) -> AioBotoStorageService:
+    
+    return AioBotoStorageService(
+        client=client,
+        public_client=client,
+        bucket_policy=dict(TEST_BUCKETS),
+        public_base_url=endpoint,
+    )
+
+
+@pytest.fixture(scope="session")
+def storage_buckets(storage_endpoint: str) -> None:
+
+    async def _create() -> None:
+        async with _storage_client(storage_endpoint) as client:
+            await _build_storage_service(client, storage_endpoint).ensure_buckets()
+
+    asyncio.run(_create())
+
+
+def _storage_client(endpoint: str):
+    return s3_client(
+        endpoint_url=endpoint,
+        access_key=STORAGE_ACCESS_KEY,
+        secret_key=STORAGE_SECRET_KEY,
+        region="us-east-1",
+    )
+
+
+@pytest.fixture
+async def s3_test_client(storage_endpoint: str, storage_buckets: None) -> AsyncGenerator[S3Client]:
+    async with _storage_client(storage_endpoint) as client:
+        yield client
+
+
+@pytest.fixture
+async def storage_service(storage_endpoint: str, s3_test_client: S3Client) -> StorageService:
+    return _build_storage_service(s3_test_client, storage_endpoint)
+
+
 @pytest.fixture(scope="session")
 async def db_engine(postgres_container: PostgresContainer) -> AsyncGenerator[AsyncEngine]:
     database_url = postgres_container.get_connection_url(driver="asyncpg")
@@ -100,12 +211,13 @@ async def db_engine(postgres_container: PostgresContainer) -> AsyncGenerator[Asy
 
 
 @pytest.fixture(scope="session", autouse=True)
-async def load_initial_data(db_engine: AsyncEngine) -> None:
+async def load_initial_data(db_engine: AsyncEngine) -> AsyncGenerator[None]:
     session_maker = async_sessionmaker(bind=db_engine, class_=AsyncSession, expire_on_commit=False)
 
     async with session_maker() as session:
-        await init_data(session)
+        await create_first_data(session)
 
+    yield
 
 
 @pytest.fixture
@@ -122,12 +234,12 @@ async def db_connection(db_engine: AsyncEngine) -> AsyncGenerator[AsyncConnectio
 
 @pytest.fixture
 async def db_session(request_container):
-    return await request_container.get(AsyncSession)
+    yield await request_container.get(AsyncSession)
 
 
 @pytest.fixture
 async def redis_client(redis_container: AsyncRedisContainer) -> AsyncGenerator[Redis]:
-    client = await redis_container.get_async_client()
+    client = await redis_container.get_async_client(decode_responses=True)
 
     try:
         yield client
@@ -145,6 +257,7 @@ def make_user_jwt() -> Callable[..., UserJWTData]:
         permissions: list[str] | None = None,
         security_level: int = 1,
         device_id: str = "device_1",
+        session_id: str = "session_1"
     ) -> UserJWTData:
         return UserJWTData(
             id=id,
@@ -153,6 +266,7 @@ def make_user_jwt() -> Callable[..., UserJWTData]:
             permissions=permissions or [],
             security_level=security_level,
             device_id=device_id,
+            session_id=session_id
         )
 
     return _make_user_jwt
@@ -169,7 +283,7 @@ def super_admin_user_jwt(make_user_jwt) -> UserJWTData:
 
 
 @pytest.fixture
-def create_access_token(jwt_manager: JWTManager) -> Callable[..., str]:
+def create_access_token(jwt_manager: JWTManager):
     def _create(user_jwt: UserJWTData) -> str:
         data = user_jwt.to_dict()
         data["type"] = JwtTokenType.ACCESS
@@ -182,7 +296,7 @@ def create_access_token(jwt_manager: JWTManager) -> Callable[..., str]:
 
 
 @pytest.fixture
-def create_auth_headers(create_access_token) -> Callable[..., dict[str, str]]:
+def create_auth_headers(create_access_token):
     def _headers(user_jwt: UserJWTData) -> dict[str, str]:
         token = create_access_token(user_jwt)
         return {"Authorization": f"Bearer {token}"}
@@ -194,6 +308,7 @@ def create_auth_headers(create_access_token) -> Callable[..., dict[str, str]]:
 async def di_container(
     db_connection: AsyncConnection,
     redis_client: Redis,
+    storage_service: StorageService,
 ) -> AsyncGenerator[AsyncContainer]:
 
     class TestProvider(Provider):
@@ -221,18 +336,47 @@ async def di_container(
             return MockMailService()
 
         @provide(scope=Scope.APP)
-        def get_mock_event_bus(self, event_registy: EventRegistry) -> BaseEventBus:
-            return MockEventBus(event_registy=event_registy)
-
-        @provide(scope=Scope.APP)
         def get_queue_service(self) -> QueueService:
             return FakeQueueService()
 
+        @provide(scope=Scope.REQUEST)
+        def get_recording_event_bus(
+            self,
+            event_registy: EventRegistry,
+            outbox_repository: OutboxRepository,
+        ) -> BaseEventBus:
+            return RecordingEventBus(
+                event_registy=event_registy,
+                outbox_repository=outbox_repository,
+            )
+
+        @provide(scope=Scope.APP)
+        def get_oauth_factory(self) -> OAuthProviderFactory:
+            factory = OAuthProviderFactory()
+            factory.register_provider(
+                FakeOAuthProvider(
+                    name='google',
+                    client_id='test-client',
+                    client_secret='test-secret',  # noqa: S106
+                    redirect_uri='https://app.test/callback',
+                    base_auth_url='https://accounts.test/authorize',
+                    token_url='https://accounts.test/token',  # noqa: S106
+                    userinfo_url='https://accounts.test/userinfo',
+                )
+            )
+            return factory
+
         @provide(scope=Scope.APP)
         def get_storage_service(self) -> StorageService:
-            return FakeStorageService()
+            return storage_service
 
-    container = create_container(TestProvider())
+        @provide(scope=Scope.APP)
+        def get_message_broker(self) -> BaseMessageBroker:
+            return FakeMessageBroker()
+
+    container = create_container(
+        TestProvider()
+    )
     try:
         yield container
     finally:
@@ -249,9 +393,10 @@ async def mock_mail_service(di_container: AsyncContainer) -> BaseMailService:
     return await di_container.get(BaseMailService)
 
 @pytest.fixture
-async def mock_event_bus(di_container: AsyncContainer) -> BaseEventBus:
-    return await di_container.get(BaseEventBus)
-
+async def mock_event_bus(request_container: AsyncContainer) -> RecordingEventBus:
+    bus = await request_container.get(BaseEventBus)
+    assert isinstance(bus, RecordingEventBus)
+    return bus
 
 @pytest.fixture
 async def mock_queue_service(di_container: AsyncContainer) -> QueueService:
@@ -264,6 +409,11 @@ async def mock_storage_service(di_container: AsyncContainer) -> StorageService:
 
 
 @pytest.fixture
+async def mock_message_broker(di_container: AsyncContainer) -> BaseMessageBroker:
+    return await di_container.get(BaseMessageBroker)
+
+
+@pytest.fixture
 async def jwt_manager(di_container: AsyncContainer) -> JWTManager:
     return await di_container.get(JWTManager)
 
@@ -271,16 +421,6 @@ async def jwt_manager(di_container: AsyncContainer) -> JWTManager:
 @pytest.fixture
 async def rbac_manager(di_container: AsyncContainer) -> RBACManagerInterface:
     return await di_container.get(RBACManagerInterface)
-
-
-@pytest.fixture
-async def app(di_container: AsyncContainer) -> FastAPI:
-    if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
-        del os.environ["PROMETHEUS_MULTIPROC_DIR"]
-
-    application = test_app()
-    setup_dishka(di_container, application)
-    return application
 
 
 def test_app() -> FastAPI:
@@ -305,12 +445,37 @@ def test_app() -> FastAPI:
 
 
 @pytest.fixture
+async def app(di_container: AsyncContainer) -> FastAPI:
+    if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
+        del os.environ["PROMETHEUS_MULTIPROC_DIR"]
+
+    application = test_app()
+    setup_dishka(di_container, application)
+    return application
+
+
+@pytest.fixture
 async def client(app: FastAPI, redis_client: Redis) -> AsyncGenerator[AsyncClient]:
     await FastAPILimiter.init(redis_client)
     transport = ASGITransport(app=app)
 
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
+
+
+def test_broker() -> KafkaBroker:
+    broker = KafkaBroker()
+    setup_consumer_router(broker)
+    return broker
+
+
+@pytest.fixture
+async def consumer_broker(di_container: AsyncContainer) -> AsyncGenerator[KafkaBroker]:
+    broker = test_broker()
+    setup_faststream_dishka(container=di_container, broker=broker, auto_inject=True)
+
+    async with TestKafkaBroker(broker) as test_kafka_broker:
+        yield test_kafka_broker
 
 
 @pytest.fixture
@@ -328,8 +493,12 @@ def app_config_override() -> dict[str, Any]:
 
 
 def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line("markers", "core: Core тесты")
     config.addinivalue_line("markers", "unit: Unit тесты")
     config.addinivalue_line("markers", "integration: Integration тесты")
     config.addinivalue_line("markers", "e2e: E2E тесты")
     config.addinivalue_line("markers", "slow: Медленные тесты")
     config.addinivalue_line("markers", "auth: Тесты модуля аутентификации")
+    config.addinivalue_line("markers", "profiles: Тесты модуля профиля")
+    config.addinivalue_line("markers", "chats: Тесты модуля chats")
+    config.addinivalue_line("markers", "notifications: Тесты модуля notifications")

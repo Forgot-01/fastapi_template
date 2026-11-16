@@ -3,7 +3,6 @@ from typing import Annotated
 from dishka import FromDishka
 from dishka.integrations.fastapi import DishkaRoute
 from fastapi import APIRouter, Cookie, Depends, Query, Request, Response, status
-from fastapi.security import OAuth2PasswordRequestForm
 
 from app.auth.commands.auth.auth_url import CreateOAuthAuthorizeUrlCommand
 from app.auth.commands.auth.login import LoginCommand
@@ -12,22 +11,29 @@ from app.auth.commands.auth.oauth import (
     ProcessOAuthCallbackCommand,
 )
 from app.auth.commands.auth.refresh_token import RefreshTokenCommand
+from app.auth.commands.users.change_password import ChangePasswordCommand
 from app.auth.commands.users.reset_password import ResetPasswordCommand
 from app.auth.commands.users.send_reset_password import SendResetPasswordCommand
 from app.auth.commands.users.send_verify import SendVerifyCommand
 from app.auth.commands.users.verify import VerifyCommand
-from app.auth.deps import CurrentUserModel
-from app.auth.dtos.tokens import TokenGroup
+from app.auth.deps import ActiveUserModel, AuthCurrentUserJWTData
+from app.auth.dtos.tokens import OAuthAccountDTO, TokenGroup
 from app.auth.exceptions import (
     LinkedAnotherUserOAuthError,
+    NoEmailOAuthError,
     NotExistProviderOAuthError,
     NotFoundOrInactiveSessionError,
     NotFoundUserError,
     OAuthStateNotFoundError,
     PasswordMismatchError,
+    UnverifiedEmailOAuthError,
     WrongLoginDataError,
 )
+from app.auth.queries.auth.oauth import GetUserOAuthAccountsQuery
 from app.auth.schemas.auth.requests import (
+    ChangePasswordRequest,
+    DeviceMetadataRequest,
+    OAuth2PasswordRequestFormWithDevice,
     OAuthCallbackQuery,
     ResetPasswordRequest,
     SendResetPasswordCodeRequest,
@@ -38,7 +44,7 @@ from app.auth.schemas.auth.responses import (
     AccessTokenResponse,
     OAuthUrlResponse,
 )
-from app.auth.services.cookie_manager import IRefreshTokenCookieManager
+from app.auth.services.cookie_manager import RefreshTokenCookieManager
 from app.core.api.builder import create_response
 from app.core.api.rate_limiter import ConfigurableRateLimiter
 from app.core.api.utils import get_ip_from_request
@@ -49,7 +55,7 @@ router = APIRouter(route_class=DishkaRoute)
 
 
 @router.post(
-    "/login",
+    "/login/",
     summary="User login",
     description="Authenticates the user and returns a pair of tokens: access and refresh.",
     status_code=status.HTTP_200_OK,
@@ -60,8 +66,8 @@ router = APIRouter(route_class=DishkaRoute)
 )
 async def login(
     mediator: FromDishka[BaseMediator],
-    refresh_cookie_manager: FromDishka[IRefreshTokenCookieManager],
-    login_request: Annotated[OAuth2PasswordRequestForm, Depends()],
+    refresh_cookie_manager: FromDishka[RefreshTokenCookieManager],
+    login_request: Annotated[OAuth2PasswordRequestFormWithDevice, Depends()],
     request: Request,
     response: Response
 ) -> AccessTokenResponse:
@@ -69,8 +75,14 @@ async def login(
         LoginCommand(
             username=login_request.username,
             password=login_request.password,
+            device_id=login_request.device_id or "",
+            platform=login_request.platform,
+            device_name=login_request.device_name,
+            os_version=login_request.os_version,
+            app_version=login_request.app_version,
+            fcm_token=login_request.fcm_token,
             user_agent=request.headers.get("user-agent", ""),
-            ip_address=get_ip_from_request(request)
+            ip_address=get_ip_from_request(request),
         )
     )
     refresh_cookie_manager.set_refresh_token(response, token_group.refresh_token)
@@ -79,7 +91,7 @@ async def login(
     )
 
 @router.post(
-    "/refresh",
+    "/refresh/",
     summary="Refreshing the access token",
     description="Refreshes the access token using the refresh token.",
     status_code=status.HTTP_200_OK,
@@ -91,7 +103,7 @@ async def login(
 )
 async def refresh(
     mediator: FromDishka[BaseMediator],
-    refresh_cookie_manager: FromDishka[IRefreshTokenCookieManager],
+    refresh_cookie_manager: FromDishka[RefreshTokenCookieManager],
     response: Response,
     request: Request,
     refresh_token: Annotated[str | None, Cookie()] = None,
@@ -109,7 +121,7 @@ async def refresh(
     )
 
 @router.post(
-    "/logout",
+    "/logout/",
     summary="User logout",
     description="Invalidates the user's refresh token to log out.",
     status_code=status.HTTP_204_NO_CONTENT,
@@ -119,7 +131,7 @@ async def refresh(
 )
 async def logout(
     mediator: FromDishka[BaseMediator],
-    refresh_cookie_manager: FromDishka[IRefreshTokenCookieManager],
+    refresh_cookie_manager: FromDishka[RefreshTokenCookieManager],
     response: Response,
     refresh_token: Annotated[str | None, Cookie()] = None
 ) -> None:
@@ -127,13 +139,10 @@ async def logout(
     refresh_cookie_manager.delete_refresh_token(response)
 
 @router.post(
-    "/verifications/email",
+    "/verifications/email/",
     summary="Sending a verification code",
     description="Sends an email verification code. Limit: 3 requests per hour.",
     status_code=status.HTTP_204_NO_CONTENT,
-    responses={
-        404: create_response(NotFoundUserError(user_by="test@test.com", user_field="email"))
-    },
     dependencies=[Depends(ConfigurableRateLimiter(times=3, seconds=60*60))],
 )
 async def send_verify_code(
@@ -145,13 +154,10 @@ async def send_verify_code(
     )
 
 @router.post(
-    "/password-resets",
+    "/password/send_reset/",
     summary="Sending a password reset code",
     description="Sends a password reset code. Limit: 3 requests per hour.",
     status_code=status.HTTP_204_NO_CONTENT,
-    responses={
-        404: create_response(NotFoundUserError(user_by="test@test.com", user_field="email"))
-    },
     dependencies=[Depends(ConfigurableRateLimiter(times=3, seconds=60*60))]
 )
 async def send_reset_password_code(
@@ -162,27 +168,8 @@ async def send_reset_password_code(
         SendResetPasswordCommand(email=send_reset_password_request.email)
     )
 
-
 @router.post(
-    "/verifications/email/verify",
-    summary="Email confirmation",
-    description="Confirms the email using the passed token.",
-    status_code=status.HTTP_204_NO_CONTENT,
-    responses={
-        400: create_response(InvalidTokenError()),
-        404: create_response(NotFoundUserError(user_by=1, user_field="id"))
-    },
-    dependencies=[Depends(ConfigurableRateLimiter(times=3, seconds=60*60))]
-)
-async def verify_email(
-    mediator: FromDishka[BaseMediator],
-    verify_email_request: VerifyEmailRequest
-) -> None:
-    await mediator.handle_command(VerifyCommand(token=verify_email_request.token))
-
-
-@router.post(
-    "/password-resets/confirm",
+    "/password/reset/",
     summary="Reset password",
     description="Resets the password using the token and new password data.",
     status_code=status.HTTP_204_NO_CONTENT,
@@ -204,9 +191,46 @@ async def reset_password(
         )
     )
 
+@router.post(
+    "/password/change/",
+    summary="Sending a password change",
+    description="Sends a password change. Limit: 3 requests per hour.",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(ConfigurableRateLimiter(times=3, seconds=60*60))]
+)
+async def change_password(
+    mediator: FromDishka[BaseMediator],
+    change_password_request: ChangePasswordRequest,
+    user_jwt_data: AuthCurrentUserJWTData
+) -> None:
+    await mediator.handle_command(
+        ChangePasswordCommand(
+            old_password=change_password_request.old_password,
+            new_password=change_password_request.password,
+            new_password_repeat=change_password_request.password_repeat,
+            user_jwt_data=user_jwt_data,
+        )
+    )
 
-@router.get(
-    "/oauth/{provider}/authorize",
+@router.post(
+    "/verifications/email/verify/",
+    summary="Email confirmation",
+    description="Confirms the email using the passed token.",
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses={
+        400: create_response(InvalidTokenError()),
+        404: create_response(NotFoundUserError(user_by=1, user_field="id"))
+    },
+    dependencies=[Depends(ConfigurableRateLimiter(times=3, seconds=60*60))]
+)
+async def verify_email(
+    mediator: FromDishka[BaseMediator],
+    verify_email_request: VerifyEmailRequest
+) -> None:
+    await mediator.handle_command(VerifyCommand(token=verify_email_request.token))
+
+@router.post(
+    "/oauth/{provider}/authorize/",
     summary="Get URL for OAuth authorization",
     status_code=status.HTTP_200_OK,
     responses={
@@ -217,16 +241,28 @@ async def reset_password(
 async def oauth_authorize(
     mediator: FromDishka[BaseMediator],
     provider: str,
+    device_request: DeviceMetadataRequest,
+    request: Request,
 ) -> OAuthUrlResponse:
     url: str = await mediator.handle_command(
-        CreateOAuthAuthorizeUrlCommand(provider=provider, user_id=None)
+        CreateOAuthAuthorizeUrlCommand(
+            provider=provider,
+            user_id=None,
+            device_id=device_request.device_id,
+            platform=device_request.platform,
+            device_name=device_request.device_name,
+            os_version=device_request.os_version,
+            app_version=device_request.app_version,
+            fcm_token=device_request.fcm_token,
+            user_agent=request.headers.get("user-agent", ""),
+            ip_address=get_ip_from_request(request),
+        )
     )
 
     return OAuthUrlResponse(url=url)
 
-
-@router.get(
-    "/oauth/{provider}/authorize/connect",
+@router.post(
+    "/oauth/{provider}/authorize/connect/",
     summary="Get the OAuth connection URL for an existing user",
     status_code=status.HTTP_200_OK,
     responses={
@@ -237,20 +273,39 @@ async def oauth_authorize(
 async def oauth_authorize_connect(
     mediator: FromDishka[BaseMediator],
     provider: str,
-    current_user: CurrentUserModel,
+    current_user: ActiveUserModel,
+    device_request: DeviceMetadataRequest,
+    request: Request,
 ) -> OAuthUrlResponse:
     url: str = await mediator.handle_command(
-        CreateOAuthAuthorizeUrlCommand(provider=provider, user_id=current_user.id)
+        CreateOAuthAuthorizeUrlCommand(
+            provider=provider,
+            user_id=current_user.id,
+            device_id=device_request.device_id,
+            platform=device_request.platform,
+            device_name=device_request.device_name,
+            os_version=device_request.os_version,
+            app_version=device_request.app_version,
+            fcm_token=device_request.fcm_token,
+            user_agent=request.headers.get("user-agent", ""),
+            ip_address=get_ip_from_request(request),
+        )
     )
     return OAuthUrlResponse(url=url)
 
 
 @router.get(
-    "/oauth/{provider}/callback",
+    "/oauth/{provider}/callback/",
     summary="Callback for OAuth provider",
     status_code=status.HTTP_200_OK,
     responses={
-        400: create_response(NotExistProviderOAuthError(provider="string")),
+        400: create_response(
+            [
+                NotExistProviderOAuthError(provider="string"),
+                NoEmailOAuthError(provider="string"),
+            ]
+        ),
+        403: create_response(UnverifiedEmailOAuthError(provider="string")),
         404: create_response(
             [
                 OAuthStateNotFoundError(state="string"),
@@ -258,13 +313,13 @@ async def oauth_authorize_connect(
             ]
         ),
         409: create_response(LinkedAnotherUserOAuthError(provider="string"))
-    }
+    },
+    dependencies=[Depends(ConfigurableRateLimiter(times=3, seconds=60*60))]
 )
 async def oauth_callback(
     provider: str,
     mediator: FromDishka[BaseMediator],
-    refresh_cookie_manager: FromDishka[IRefreshTokenCookieManager],
-    request: Request,
+    refresh_cookie_manager: FromDishka[RefreshTokenCookieManager],
     response: Response,
     oauth_callback_query: Annotated[OAuthCallbackQuery, Query()],
 ) -> AccessTokenResponse:
@@ -273,10 +328,22 @@ async def oauth_callback(
             provider=provider,
             code=oauth_callback_query.code,
             state=oauth_callback_query.state,
-            user_agent=request.headers.get("user-agent", ""),
-            ip_address=get_ip_from_request(request)
         )
     )
     refresh_cookie_manager.set_refresh_token(response, token_group.refresh_token)
     return AccessTokenResponse(access_token=token_group.access_token)
 
+@router.get(
+    "/oauth/",
+    summary="Get list oauth linked",
+    status_code=status.HTTP_200_OK,
+)
+async def get_list_oauth(
+    mediator: FromDishka[BaseMediator],
+    user_jwt_data: AuthCurrentUserJWTData
+) -> list[OAuthAccountDTO]:
+    return await mediator.handle_query(
+        GetUserOAuthAccountsQuery(
+            user_jwt_data=user_jwt_data
+        )
+    )

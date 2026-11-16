@@ -1,4 +1,5 @@
 from typing import Annotated
+from uuid import UUID
 
 from dishka.integrations.fastapi import DishkaRoute, FromDishka
 from fastapi import APIRouter, Query, status
@@ -19,7 +20,7 @@ router = APIRouter(route_class=DishkaRoute)
 
 
 @router.delete(
-    "/{session_id}",
+    "/{session_id}/",
     summary="Log out of session",
     description="Log out of session",
     status_code=status.HTTP_204_NO_CONTENT,
@@ -29,7 +30,7 @@ router = APIRouter(route_class=DishkaRoute)
     }
 )
 async def user_session_delete(
-    session_id: int,
+    session_id: UUID,
     user_jwt_data: AuthCurrentUserJWTData,
     mediator: FromDishka[BaseMediator],
 ) -> None:

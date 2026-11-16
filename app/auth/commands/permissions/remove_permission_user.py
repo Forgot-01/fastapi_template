@@ -50,8 +50,7 @@ class DeletePermissionToUserCommandHandler(BaseCommandHandler[DeletePermissionTo
             raise NotFoundPermissionsError(missing=missing)
 
         for permission in permissions:
-            if permission in user.permissions:
-                user.delete_permission(permission)
+            user.delete_permission(permission)
 
         await self.token_blacklist.add_user(user.id)
         await self.session.commit()

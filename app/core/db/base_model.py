@@ -28,14 +28,6 @@ class BaseModel(DeclarativeBase):
         self.events.clear()
         return registered_events
 
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> Self:
-        return cls(**{k: v for k, v in data.items() if k in cls._get_field_names()})
-
-    @classmethod
-    def _get_field_names(cls) -> list[str]:
-        return [column.name for column in cls.__table__.columns]
-
 
 class DateMixin:
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -51,11 +43,12 @@ class SoftDeleteMixin:
         return mapped_column(DateTime(timezone=True), nullable=True)
 
     @classmethod
-    def select_not_deleted(cls) -> Select[tuple[Self]]:
+    def select_not_deleted(cls) -> Select[Self]:
         return select(cls).where(cls.deleted_at.is_(None))
 
     def soft_delete(self) -> None:
         self.deleted_at = now_utc()
 
+    @property
     def is_deleted(self) -> bool:
         return self.deleted_at is not None

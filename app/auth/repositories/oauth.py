@@ -2,15 +2,15 @@ from dataclasses import dataclass
 from datetime import timedelta
 
 from redis.asyncio import Redis
-from sqlalchemy import Select, select
+from sqlalchemy import select
 
-from app.auth.filters.oauth import OauthFilter
+from app.auth.dtos.device import OAuthInfo
 from app.auth.models.oauth import OAuthAccount, OAuthProviderEnum
 from app.core.db.repository import IRepository
 
 
 @dataclass
-class OauthAccountRepository(IRepository[OAuthAccount, OauthFilter]):
+class OauthAccountRepository(IRepository[OAuthAccount]):
     async def create(self, oauth_account: OAuthAccount) -> None:
         self.session.add(oauth_account)
 
@@ -34,25 +34,19 @@ class OauthAccountRepository(IRepository[OAuthAccount, OauthFilter]):
         result = await self.session.execute(query)
         return list(result.scalars().all())
 
-    def apply_relationship_filters(self, stmt: Select, filters: OauthFilter) -> Select:
-        return stmt
-
 
 @dataclass
 class OAuthCodeRepository:
     client: Redis
 
-    async def add_oauth_state(self, state: str, user_id: int | None=None) -> None:
-        await self.client.set(
-            f"state:{state}", user_id or 0, ex=timedelta(minutes=10)
-        )
+    async def add_oauth_info(self, state: str, auth_info: OAuthInfo) -> None:
+            await self.client.set(
+                f"oauth:state:{state}", auth_info.model_dump_json(), ex=timedelta(minutes=10)
+            )
 
-    async def get_state(self, state: str) -> int | None:
-        res = await self.client.get(f"state:{state}")
-        if res is None:
+    async def getdel_oauth_info(self, state: str) -> OAuthInfo | None:
+        auth_info = await self.client.getdel(f"oauth:state:{state}")
+        if auth_info is None:
             return None
 
-        return int(res)
-
-    async def delete(self, state: str) -> None:
-        await self.client.delete(f"state:{state}")
+        return OAuthInfo.model_validate_json(auth_info)

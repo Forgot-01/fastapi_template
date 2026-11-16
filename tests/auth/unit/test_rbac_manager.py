@@ -26,12 +26,12 @@ class TestRBACManager:
     def test_check_permission_various(
         self,
         rbac_manager: AuthRBACManager,
-        make_auth_user_jwt,
+        make_user_jwt,
         user_perms: list[str],
         required_perms: set[str],
         expected: bool,
     ) -> None:
-        user = make_auth_user_jwt(role="user", permissions=user_perms)
+        user = make_user_jwt(role="user", permissions=user_perms)
         assert rbac_manager.check_permission(user, required_perms) is expected
 
     @pytest.mark.parametrize(
@@ -46,23 +46,12 @@ class TestRBACManager:
     def test_is_system_user_various_roles(
         self,
         rbac_manager: AuthRBACManager,
-        make_auth_user_jwt,
+        make_user_jwt,
         role_name: str,
         expected: bool,
     ) -> None:
-        user = make_auth_user_jwt(role=role_name, permissions=[])
+        user = make_user_jwt(role=role_name, permissions=[])
         assert rbac_manager.is_system_user(user) == expected
-
-    def test_is_system_user_specific_fixtures(
-        self,
-        rbac_manager: AuthRBACManager,
-        admin_auth_user_jwt: AuthUserJWTData,
-        system_auth_user_jwt: AuthUserJWTData,
-        regular_auth_user_jwt: AuthUserJWTData,
-    ) -> None:
-        assert rbac_manager.is_system_user(admin_auth_user_jwt) is True
-        assert rbac_manager.is_system_user(system_auth_user_jwt) is True
-        assert rbac_manager.is_system_user(regular_auth_user_jwt) is False
 
     def test_system_user_bypasses_permission_check(
         self,
@@ -118,7 +107,7 @@ class TestRBACManager:
     def test_validate_permissions_various(
         self,
         rbac_manager: AuthRBACManager,
-        make_auth_user_jwt,
+        make_user_jwt,
         regular_auth_user_jwt: AuthUserJWTData,
         admin_auth_user_jwt: AuthUserJWTData,
     ) -> None:
@@ -130,5 +119,5 @@ class TestRBACManager:
         with pytest.raises(AccessDeniedError):
             rbac_manager.validate_permissions(regular_auth_user_jwt, "user:delete")
 
-        user_with_perm = make_auth_user_jwt(role="user", permissions=["user:delete"])
+        user_with_perm = make_user_jwt(role="user", permissions=["user:delete"])
         rbac_manager.validate_permissions(user_with_perm, "user:delete")

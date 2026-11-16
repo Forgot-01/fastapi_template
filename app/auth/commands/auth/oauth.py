@@ -6,9 +6,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth.dtos.tokens import TokenGroup
 from app.auth.dtos.user import AuthUserJWTData
 from app.auth.exceptions import (
+    InvalidOAuthProviderError,
     LinkedAnotherUserOAuthError,
     NotFoundRoleError,
     NotFoundUserError,
+    OAuthInactiveError,
+    OAuthProviderUnavailableError,
     OAuthStateNotFoundError,
 )
 from app.auth.models.oauth import OAuthAccount, OAuthProviderEnum
@@ -19,7 +22,8 @@ from app.auth.repositories.role import RoleRepository
 from app.auth.repositories.user import UserRepository
 from app.auth.services.jwt import AuthJWTManager
 from app.auth.services.oauth_manager import OAuthManager
-from app.auth.services.session import SessionManager
+from app.auth.services.session import DeviceSessionManager
+from app.auth.services.username import UsernameGenerator
 from app.core.commands import BaseCommand, BaseCommandHandler
 from app.core.events.service import BaseEventBus
 
@@ -29,10 +33,8 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class ProcessOAuthCallbackCommand(BaseCommand):
     provider: str
-    code: str
+    code: str | None
     state: str
-    user_agent: str
-    ip_address: str
 
 
 @dataclass(frozen=True)
@@ -42,17 +44,30 @@ class ProcessOAuthCallbackCommandHandler(BaseCommandHandler[ProcessOAuthCallback
     oauth_manager: OAuthManager
     user_repository: UserRepository
     role_repository: RoleRepository
-    session_manager: SessionManager
+    session_manager: DeviceSessionManager
     oauth_repository: OauthAccountRepository
     oauth_code_repository: OAuthCodeRepository
+    username_generator: UsernameGenerator
     event_bus: BaseEventBus
 
     async def handle(self, command: ProcessOAuthCallbackCommand) -> TokenGroup:
-            oauth_data = await self.oauth_manager.process_callback(command.provider, command.code)
-            user_id = await self.oauth_code_repository.get_state(command.state)
+            if command.code is None:
+                raise OAuthProviderUnavailableError(provider=command.provider)
 
-            if user_id is None:
+            oauth_info = await self.oauth_code_repository.getdel_oauth_info(command.state)
+            if oauth_info is None:
                 raise OAuthStateNotFoundError(state=command.state)
+
+            if oauth_info.provider != command.provider:
+                raise InvalidOAuthProviderError
+
+            user_id = oauth_info.user_id or 0
+
+            oauth_data = await self.oauth_manager.process_callback(
+                command.provider,
+                command.code,
+                code_verifier=oauth_info.code_verifier,
+            )
 
             oauth_account = await self.oauth_repository.get_by_provider_and_user_id(
                 provider=OAuthProviderEnum(command.provider), provider_user_id=oauth_data.provider_user_id
@@ -76,6 +91,9 @@ class ProcessOAuthCallbackCommandHandler(BaseCommandHandler[ProcessOAuthCallback
                     raise NotFoundUserError(user_by=user_id, user_field="id")
 
             elif oauth_account:
+                if oauth_account.is_active is False:
+                    raise OAuthInactiveError
+
                 user = await self.user_repository.get_user_with_permission_by_id(oauth_account.user_id)
 
                 if not user:
@@ -96,11 +114,15 @@ class ProcessOAuthCallbackCommandHandler(BaseCommandHandler[ProcessOAuthCallback
 
                 user = User.create_oauth(
                     email=oauth_data.email,
-                    username=oauth_data.email,
+                    username=await self.username_generator.generate(
+                        preferred=oauth_data.username, email=oauth_data.email
+                    ),
                     roles={role }
                 )
                 await self.user_repository.create(user)
-                await self.session.commit()
+                await self.session.flush()
+                user.verify()
+                await self.event_bus.publish(user.pull_events())
 
                 user_id = user.id
                 oauth_account = OAuthAccount(
@@ -111,22 +133,24 @@ class ProcessOAuthCallbackCommandHandler(BaseCommandHandler[ProcessOAuthCallback
                 )
                 await self.oauth_repository.create(oauth_account)
 
-            session = await self.session_manager.get_or_create_session(
-                user_id=user_id, user_agent=command.user_agent, ip_address=command.ip_address
+            device, session = await self.session_manager.get_or_create_session(
+                user_id=user_id, did=oauth_info.device.device_id, device_name=oauth_info.device.device_name,
+                platform=oauth_info.device.platform, os_version=oauth_info.device.os_version,
+                app_version=oauth_info.device.app_version, fcm_token=oauth_info.device.fcm_token,
+                ip_address=oauth_info.ip_address, user_agent=oauth_info.user_agent
             )
-            await self.oauth_code_repository.delete(command.state)
-            await self.session.commit()
             await self.event_bus.publish(session.pull_events())
+            await self.session.commit()
 
             token_group = self.jwt_manager.create_token_pair(
-                AuthUserJWTData.create_from_user(user, device_id=session.device_id)
+                AuthUserJWTData.create_from_user(user, device_id=str(device.id), session_id=str(session.id))
             )
 
             logger.info(
                 "OAuth Callback",
                 extra={
                     "provider": command.provider,
-                    "oauth_id": getattr(oauth_account, "id", None),
+                    "oauth_id": oauth_account.id,
                     "user_id": user_id
                 }
             )

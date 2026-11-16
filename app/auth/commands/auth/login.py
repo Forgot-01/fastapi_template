@@ -9,7 +9,7 @@ from app.auth.exceptions import WrongLoginDataError
 from app.auth.repositories.user import UserRepository
 from app.auth.services.hash import HashService
 from app.auth.services.jwt import AuthJWTManager
-from app.auth.services.session import SessionManager
+from app.auth.services.session import DeviceSessionManager
 from app.core.commands import BaseCommand, BaseCommandHandler
 from app.core.events.service import BaseEventBus
 
@@ -19,15 +19,23 @@ logger = logging.getLogger(__name__)
 class LoginCommand(BaseCommand):
     username: str
     password: str
-    user_agent: str
+
+    device_id: str
+    platform: str
+    device_name: str
+
+    os_version: str | None
+    app_version: str | None
+    fcm_token: str | None
     ip_address: str
+    user_agent: str
 
 
 @dataclass(frozen=True)
 class LoginCommandHandler(BaseCommandHandler[LoginCommand, TokenGroup]):
     session: AsyncSession
     user_repository: UserRepository
-    session_manager: SessionManager
+    session_manager: DeviceSessionManager
     jwt_manager: AuthJWTManager
     hash_service: HashService
     event_bus: BaseEventBus
@@ -40,21 +48,25 @@ class LoginCommandHandler(BaseCommandHandler[LoginCommand, TokenGroup]):
 
         if (
             (user is None) or
+            (user.is_deleted) or
             (user.password_hash is None) or
             (not self.hash_service.verify_password(command.password, user.password_hash))
         ):
             raise WrongLoginDataError(username=command.username)
 
-        session = await self.session_manager.get_or_create_session(
-            user_id=user.id, user_agent=command.user_agent, ip_address=command.ip_address
+        device, session = await self.session_manager.get_or_create_session(
+            user_id=user.id, did=command.device_id, device_name=command.device_name,
+            platform=command.platform, os_version=command.os_version,
+            app_version=command.app_version, fcm_token=command.fcm_token,
+            ip_address=command.ip_address, user_agent=command.user_agent
         )
 
-        await self.session.commit()
         await self.event_bus.publish(session.pull_events())
+        await self.session.commit()
 
         token_group = self.jwt_manager.create_token_pair(
-            AuthUserJWTData.create_from_user(user, device_id=session.device_id)
+            AuthUserJWTData.create_from_user(user, device_id=str(device.id), session_id=str(session.id))
         )
 
-        logger.info("Logging user", extra={"user_id": user.id, "device_id": session.device_id})
+        logger.info("Logining user", extra={"user_id": user.id, "device_id": session.device_id})
         return token_group
