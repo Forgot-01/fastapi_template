@@ -1,49 +1,117 @@
 target-version = "py314"
 line-length = 120
 
-[lint]
 exclude = [
     ".git",
-    "__pycache__",
+    ".github",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
     ".venv",
+    "venv",
     "env",
     "dist",
     "build",
     "docs",
     "benchmarks",
-    "migrations"
+    "migrations",
+    "__pycache__",
 ]
+
+[lint]
 select = [
-    "E",  # pycodestyle errors
-    "W",  # pycodestyle warnings
-    "F",  # pyflakes
-    "I",  # isort
-    "B",  # flake8-bugbear
-    "C4",  # flake8-comprehensions
-    "UP",  # pyupgrade
-    "ARG001", # unused arguments in functions
-    "T201",   # print statements are not allowed
+    # pycodestyle
+    "E",
+    "W",
+
+    # Pyflakes
+    "F",
+
+    # isort
+    "I",
+
+    # flake8-bugbear
+    "B",
+
+    # flake8-comprehensions
+    "C4",
+
+    # pyupgrade
+    "UP",
+
+    # flake8-simplify
+    "SIM",
+
+    # flake8-pie
+    "PIE",
+
+    # flake8-return
+    "RET",
+
+    # flake8-raise
+    "RSE",
+
+    # flake8-unused-arguments
+    "ARG",
+
+    # flake8-print
+    "T20",
+
+    # flake8-implicit-str-concat
+    "ISC",
+
+    # pathlib
+    "PTH",
+
+    # flake8-bandit security checks
+    "S",
 ]
+
 ignore = [
-    "ARG001", # Unused function argument
-    "E501",  # line too long, handled by black
-    "B008",  # do not perform function calls in argument defaults
-    "W191",  # indentation contains tabs
-    "B904",  # Allow raising exceptions without from e, for HTTPException
+    # Formatting is handled by `ruff format`
+    "E501",
+
+    # Common in FastAPI:
+    # Depends(...), Query(...), Body(...), etc.
+    "B008",
+
+    # Allow raising framework exceptions without
+    # preserving the original exception context.
+    "B904",
+
+    "RET504",
+    "SIM103",
+
 ]
 
 [lint.isort]
 combine-as-imports = true
+force-wrap-aliases = true
+known-first-party = [
+    "app",
+]
 
 [lint.mccabe]
 max-complexity = 12
 
-[lint.pydocstyle]
-convention = "pep257"
-
 [lint.per-file-ignores]
-"**/__init__.py" = ["F401"]
-"tests/**/*.py" = [
-    "S101",  # использование assert
-    "D",     # не требовать докстринги
+"**/__init__.py" = [
+    "F401",
 ]
+
+"tests/**/*.py" = [
+    "S101",  # assert is normal in tests
+    "D",     # docstrings are not required in tests
+    "ARG",   # unused args can be intentional in fixtures
+]
+
+"scripts/**/*.py" = [
+    "T201",  # print() can be legitimate in CLI scripts
+]
+
+[format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+skip-magic-trailing-comma = false
+docstring-code-format = true

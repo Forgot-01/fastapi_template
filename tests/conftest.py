@@ -151,7 +151,7 @@ TEST_BUCKETS: dict[str, Policy] = {
 
 
 def _build_storage_service(client: S3Client, endpoint: str) -> AioBotoStorageService:
-    
+
     return AioBotoStorageService(
         client=client,
         public_client=client,

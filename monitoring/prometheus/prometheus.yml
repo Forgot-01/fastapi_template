@@ -4,6 +4,9 @@ global:
   external_labels:
     monitor: 'fast-api-monitor'
 
+rule_files:
+  - /etc/prometheus/alerts.yml
+
 scrape_configs:
   - job_name: 'prometheus'
     static_configs:
@@ -12,6 +15,11 @@ scrape_configs:
   - job_name: 'fastapi'
     static_configs:
       - targets: ['app:8000']
+    metrics_path: '/metrics'
+
+  - job_name: 'consumers'
+    static_configs:
+      - targets: ['consumers:9002']
     metrics_path: '/metrics'
 
   - job_name: 'redis'
@@ -25,3 +33,9 @@ scrape_configs:
   - job_name: 'kafka'
     static_configs:
       - targets: ['kafka-exporter:9308']
+
+  - job_name: seaweedfs
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets: ['seaweedfs:9324']

@@ -7,10 +7,6 @@ __pycache__
 .env
 .venv
 .vscode
-.mypy_cache
-.pytest_cache
-.ruff_cache
-
 monitoring
 tests
 nginx
